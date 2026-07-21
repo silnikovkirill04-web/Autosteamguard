@@ -1,0 +1,698 @@
+"""
+SteamGuard Code v5.2 — Команда SGC, без проверки Steam, мониторинг чатов
+Офлайн-версия для выдачи кодов Steam Guard (Ультра-быстрая)
+"""
+import uuid as uuid_lib
+import json
+import os
+import imaplib
+import email
+import re
+import time
+import threading
+from datetime import datetime, timedelta
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+NAME = "SteamGuard Code"
+VERSION = "5.3.0"
+DESCRIPTION = "Выдача Steam Guard по команде SGC (Ultra)"
+CREDITS = "@qneiz"
+UUID = str(uuid_lib.uuid4())
+SETTINGS_PAGE = False
+
+CONFIG_PATH = "storage/cache/steamguard_config.json"
+
+cardinal = None
+tg = None
+bot = None
+
+# 🔥 НАСТРОЙКИ
+SETTINGS = {
+    "imap_host": "imap.gmail.com",
+    "imap_port": 993,
+    "imap_login": "silnikovkirill04@gmail.com",
+    "imap_password": "gotihysatnhmsowx",
+    "steam_sender": "noreply@steampowered.com",
+    "active": True,
+    "max_codes_per_order": 2,
+    "search_timeout": 300,
+    "session_timeout": 600,
+    "delete_after_use": True,
+    "mail_status": False,
+    "mail_count": 0,
+    "mail_last_check": "",
+    "order_code_counter": {},
+    "issued_codes": {},
+    "active_sessions": {},
+}
+
+# 🔥 БЕЗОПАСНЫЕ ФИЛЬТРЫ
+BLOCKED_SUBJECTS = [
+    "пароль", "password", "смена", "change", "reset", "сброс",
+    "восстановление", "recovery", "удаление", "delete"
+]
+
+BLOCKED_BODY = [
+    "сменить пароль", "change password", "reset password",
+    "удалить аккаунт", "delete account"
+]
+
+GUARD_KEYWORDS = [
+    "steam guard", "код steam", "steam verification code",
+    "ваш код подтверждения steam", "steam guard code",
+    "вход", "login"
+]
+
+active_searches = {}
+idle_connection = None
+idle_thread_running = False
+
+# ============================================
+# 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
+# ============================================
+
+def load_config():
+    global SETTINGS
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                for k in loaded:
+                    if k in SETTINGS:
+                        SETTINGS[k] = loaded[k]
+    except: pass
+
+def save_config():
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
+    except: pass
+
+# ============================================
+# 📧 РАБОТА С ПОЧТОЙ
+# ============================================
+
+def get_imap():
+    try:
+        conn = imaplib.IMAP4_SSL(SETTINGS["imap_host"], SETTINGS["imap_port"], timeout=10)
+        conn.login(SETTINGS["imap_login"], SETTINGS["imap_password"])
+        conn.select("INBOX")
+        return conn
+    except:
+        return None
+
+def check_mail():
+    try:
+        conn = imaplib.IMAP4_SSL(SETTINGS["imap_host"], SETTINGS["imap_port"], timeout=10)
+        conn.login(SETTINGS["imap_login"], SETTINGS["imap_password"])
+        conn.select("INBOX")
+        _, mails = conn.search(None, "ALL")
+        count = len(mails[0].split()) if mails[0] else 0
+        conn.logout()
+        SETTINGS["mail_status"] = True
+        SETTINGS["mail_count"] = count
+        SETTINGS["mail_last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        save_config()
+        return True, count
+    except:
+        SETTINGS["mail_status"] = False
+        save_config()
+        return False, 0
+
+# ============================================
+# 🔥 IMAP IDLE (МГНОВЕННЫЙ ПУШ)
+# ============================================
+
+def idle_worker():
+    """Постоянное соединение с IMAP IDLE для мгновенного получения писем"""
+    global idle_connection, idle_thread_running
+    
+    while SETTINGS["active"]:
+        try:
+            conn = get_imap()
+            if not conn:
+                time.sleep(5)
+                continue
+            
+            idle_connection = conn
+            
+            conn.send(b'IDLE\r\n')
+            print("[SG] 📡 IMAP IDLE активирован. Ожидаю новые письма...")
+            
+            response = conn.readline()
+            
+            if b'EXISTS' in response:
+                print("[SG] 📨 Новое письмо обнаружено!")
+                conn.send(b'DONE\r\n')
+                conn.readline()
+                
+                code = fetch_code_idle(conn)
+                if code:
+                    print(f"[SG] 🔥 Код найден через IDLE: {code}")
+                    for chat_id, search in list(active_searches.items()):
+                        if not search.get("notified", False):
+                            order_id = search["order_id"]
+                            attempt = search["attempt"]
+                            SETTINGS["order_code_counter"][order_id] = SETTINGS["order_code_counter"].get(order_id, 0) + 1
+                            SETTINGS["issued_codes"][code] = {"time": datetime.now().strftime("%d.%m.%Y %H:%M:%S")}
+                            save_config()
+                            
+                            remaining = SETTINGS["max_codes_per_order"] - SETTINGS["order_code_counter"][order_id]
+                            start_session(chat_id)
+                            
+                            cardinal.send_message(chat_id,
+                                f"⚡ Код найден мгновенно!\n\n"
+                                f"🔐 Код #{attempt}: {code}\n\n"
+                                f"{'📥 Осталось попыток: '+str(remaining) if remaining > 0 else '⚠️ Попыток больше нет!'}\n\n"
+                                f"⏰ У вас 10 минут на вход в аккаунт.\n"
+                                f"⚠️ После этого код станет недействительным."
+                            )
+                            search["notified"] = True
+                            del active_searches[chat_id]
+                            break
+                
+                try:
+                    conn.close()
+                    conn.logout()
+                except:
+                    pass
+                idle_connection = None
+                
+            elif b'DONE' in response or b'BYE' in response:
+                try:
+                    conn.close()
+                    conn.logout()
+                except:
+                    pass
+                idle_connection = None
+                time.sleep(1)
+            
+        except Exception as e:
+            print(f"[SG] IDLE ошибка: {e}")
+            try:
+                if idle_connection:
+                    idle_connection.close()
+                    idle_connection.logout()
+            except:
+                pass
+            idle_connection = None
+            time.sleep(5)
+
+def fetch_code_idle(conn):
+    """Поиск кода через IDLE соединение"""
+    try:
+        _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
+        if not mail_ids[0]:
+            return None
+        
+        mail_id = mail_ids[0].split()[-1]
+        _, raw = conn.fetch(mail_id, "(RFC822)")
+        mail_obj = email.message_from_bytes(raw[0][1])
+        
+        subject = mail_obj.get("Subject", "").lower()
+        if any(w in subject for w in BLOCKED_SUBJECTS):
+            return None
+        
+        body = ""
+        if mail_obj.is_multipart():
+            for part in mail_obj.walk():
+                if part.get_content_type() == "text/plain":
+                    body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    break
+        else:
+            body = mail_obj.get_payload(decode=True).decode("utf-8", errors="ignore")
+        
+        body_lower = body.lower()
+        
+        if any(w in body_lower for w in BLOCKED_BODY):
+            return None
+        
+        code_match = re.search(r'^\s*([A-Z0-9]{5})\s*$', body, re.MULTILINE)
+        if not code_match:
+            code_match = re.search(r'код\s*[:.]?\s*([A-Z0-9]{5})', body_lower)
+        if not code_match:
+            code_match = re.search(r'\b([A-Z0-9]{5})\b', body)
+        
+        if code_match:
+            code = code_match.group(1) if len(code_match.groups()) > 0 else code_match.group(0)
+            code = code.upper()
+            
+            if any(kw in body_lower for kw in GUARD_KEYWORDS):
+                if SETTINGS.get("delete_after_use", True):
+                    conn.store(mail_id, "+FLAGS", "\\Deleted")
+                    conn.expunge()
+                    print("[SG] 🗑️ Письмо удалено после выдачи")
+                else:
+                    conn.store(mail_id, "+FLAGS", "\\Seen")
+                return code
+        
+        return None
+    except Exception as e:
+        print(f"[SG] Ошибка fetch_code_idle: {e}")
+        return None
+
+# ============================================
+# 🧪 ТЕСТОВАЯ ФУНКЦИЯ
+# ============================================
+
+def test_steam_mail(message):
+    chat_id = message.chat.id
+    cardinal.send_message(chat_id, "🔍 Проверяю новые письма от Steam...")
+    
+    def worker():
+        try:
+            conn = get_imap()
+            if not conn:
+                cardinal.send_message(chat_id, "❌ Не удалось подключиться к почте!")
+                return
+            
+            _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
+            
+            if not mail_ids[0]:
+                cardinal.send_message(chat_id, "📭 Новых писем от Steam не найдено!")
+                conn.close(); conn.logout()
+                return
+            
+            total = len(mail_ids[0].split())
+            last_5 = mail_ids[0].split()[-5:] if total > 5 else mail_ids[0].split()
+            
+            response = f"📬 Найдено новых писем от Steam: {total}\n"
+            response += f"🔍 Проверяю последние {len(last_5)} новых писем:\n\n"
+            
+            found_codes = []
+            
+            for idx, mail_id in enumerate(reversed(last_5), 1):
+                _, raw = conn.fetch(mail_id, "(RFC822)")
+                mail_obj = email.message_from_bytes(raw[0][1])
+                
+                subject = mail_obj.get("Subject", "Без темы")
+                date = mail_obj.get("Date", "Нет даты")
+                
+                response += f"📧 Письмо #{idx}:\n"
+                response += f"   Тема: {subject}\n"
+                response += f"   Дата: {date}\n"
+                
+                body = ""
+                if mail_obj.is_multipart():
+                    for part in mail_obj.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                            break
+                else:
+                    body = mail_obj.get_payload(decode=True).decode("utf-8", errors="ignore")
+                
+                body_lower = body.lower()
+                code_match = re.search(r'^\s*([A-Z0-9]{5})\s*$', body, re.MULTILINE)
+                if not code_match:
+                    code_match = re.search(r'код\s*[:.]?\s*([A-Z0-9]{5})', body_lower)
+                if not code_match:
+                    code_match = re.search(r'\b([A-Z0-9]{5})\b', body)
+                
+                if code_match:
+                    code = code_match.group(1) if len(code_match.groups()) > 0 else code_match.group(0)
+                    code = code.upper()
+                    is_guard = any(kw in body_lower for kw in GUARD_KEYWORDS)
+                    
+                    if is_guard:
+                        response += f"   ✅ Код: {code} (Steam Guard)\n"
+                        found_codes.append(code)
+                    else:
+                        response += f"   ⚠️ Код: {code} (не Steam Guard)\n"
+                else:
+                    response += "   ❌ Кодов не найдено\n"
+                
+                body_preview = body[:200].replace('\n', ' ').replace('\r', '')
+                response += f"   Текст: {body_preview}...\n\n"
+            
+            if found_codes:
+                response += f"\n✅ Найдено кодов Steam Guard: {', '.join(found_codes)}\n"
+                response += f"🗑️ Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}\n"
+            else:
+                response += f"\n❌ Кодов Steam Guard не найдено.\n"
+            
+            conn.close(); conn.logout()
+            
+            if len(response) > 4000:
+                parts = [response[i:i+4000] for i in range(0, len(response), 4000)]
+                for part in parts:
+                    cardinal.send_message(chat_id, part)
+            else:
+                cardinal.send_message(chat_id, response)
+            
+        except Exception as e:
+            cardinal.send_message(chat_id, f"❌ Ошибка: {e}")
+    
+    threading.Thread(target=worker, daemon=True).start()
+
+# ============================================
+# 🔄 ОСНОВНАЯ ЛОГИКА (БЕЗ СПАМА)
+# ============================================
+
+def fetch_code_fallback():
+    """Обычный поиск кода (без IDLE)"""
+    conn = get_imap()
+    if not conn: 
+        return None
+    
+    try:
+        _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
+        if not mail_ids[0]:
+            conn.close()
+            conn.logout()
+            return None
+        
+        for mail_id in reversed(mail_ids[0].split()[-5:]):
+            _, raw = conn.fetch(mail_id, "(RFC822)")
+            mail_obj = email.message_from_bytes(raw[0][1])
+            
+            subject = mail_obj.get("Subject", "").lower()
+            if any(w in subject for w in BLOCKED_SUBJECTS):
+                continue
+            
+            body = ""
+            if mail_obj.is_multipart():
+                for part in mail_obj.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        break
+            else:
+                body = mail_obj.get_payload(decode=True).decode("utf-8", errors="ignore")
+            
+            body_lower = body.lower()
+            
+            if any(w in body_lower for w in BLOCKED_BODY):
+                continue
+            
+            code_match = re.search(r'^\s*([A-Z0-9]{5})\s*$', body, re.MULTILINE)
+            if not code_match:
+                code_match = re.search(r'код\s*[:.]?\s*([A-Z0-9]{5})', body_lower)
+            if not code_match:
+                code_match = re.search(r'\b([A-Z0-9]{5})\b', body)
+            
+            if code_match:
+                code = code_match.group(1) if len(code_match.groups()) > 0 else code_match.group(0)
+                code = code.upper()
+                
+                if any(kw in body_lower for kw in GUARD_KEYWORDS):
+                    if SETTINGS.get("delete_after_use", True):
+                        conn.store(mail_id, "+FLAGS", "\\Deleted")
+                        conn.expunge()
+                    else:
+                        conn.store(mail_id, "+FLAGS", "\\Seen")
+                    conn.close()
+                    conn.logout()
+                    return code
+        
+        conn.close()
+        conn.logout()
+        return None
+        
+    except Exception as e:
+        print(f"[SG] Ошибка fetch_code_fallback: {e}")
+        try:
+            conn.close()
+            conn.logout()
+        except:
+            pass
+        return None
+
+def chat_scanner():
+    """Сканер без спам-уведомлений"""
+    processed = {}
+    while True:
+        if not SETTINGS["active"]: 
+            time.sleep(1); 
+            continue
+        try:
+            now = time.time()
+            timeout = SETTINGS["search_timeout"]
+            
+            # Проверяем активные поиски (тихо, без спама)
+            for chat_id in list(active_searches.keys()):
+                search = active_searches[chat_id]
+                elapsed = now - search["start_time"]
+                
+                # Только сообщение об истечении времени
+                if elapsed > timeout:
+                    cardinal.send_message(chat_id,
+                        f"⏰ Время поиска истекло (5 минут)\n"
+                        f"Код не найден. Попытка НЕ потрачена.\n"
+                        f"🔄 Отправьте SGC снова."
+                    )
+                    del active_searches[chat_id]
+                    continue
+                
+                # Если IDLE не активен - проверяем обычным способом
+                if not idle_connection:
+                    code = fetch_code_fallback()
+                    if code:
+                        order_id = search["order_id"]
+                        attempt = search["attempt"]
+                        SETTINGS["order_code_counter"][order_id] = SETTINGS["order_code_counter"].get(order_id, 0) + 1
+                        SETTINGS["issued_codes"][code] = {"time": datetime.now().strftime("%d.%m.%Y %H:%M:%S")}
+                        save_config()
+                        
+                        remaining = SETTINGS["max_codes_per_order"] - SETTINGS["order_code_counter"][order_id]
+                        start_session(chat_id)
+                        
+                        cardinal.send_message(chat_id,
+                            f"🎉 Код найден!\n\n"
+                            f"🔐 Код #{attempt}: {code}\n\n"
+                            f"{'📥 Осталось попыток: '+str(remaining) if remaining > 0 else '⚠️ Попыток больше нет!'}\n\n"
+                            f"⏰ У вас 10 минут на вход в аккаунт."
+                        )
+                        del active_searches[chat_id]
+                        continue
+            
+            # Проверяем новые сообщения
+            chats = cardinal.account.get_chats(update=True)
+            if not chats: 
+                time.sleep(1); 
+                continue
+            
+            for chat_id, chat in chats.items():
+                if not chat.unread: 
+                    continue
+                
+                try: 
+                    msgs = cardinal.account.get_chat_history(chat_id)
+                except: 
+                    continue
+                if not msgs: 
+                    continue
+                
+                buyer_text = ""; 
+                msg_id = 0
+                for msg in reversed(msgs):
+                    if hasattr(msg, "author_id") and msg.author_id not in (cardinal.account.id, 0):
+                        if msg.text and msg.text.strip():
+                            buyer_text = msg.text.strip(); 
+                            msg_id = msg.id
+                            break
+                
+                if not buyer_text: 
+                    continue
+                if buyer_text.upper().strip() != "SGC": 
+                    continue
+                if chat_id in processed and processed[chat_id] >= msg_id: 
+                    continue
+                if chat_id in active_searches:
+                    cardinal.send_message(chat_id, "⏳ Уже ищу код для вас! Ожидайте.")
+                    processed[chat_id] = msg_id
+                    continue
+                
+                order_id = f"chat_{chat_id}"
+                order_cnt = SETTINGS["order_code_counter"].get(order_id, 0)
+                max_codes = SETTINGS["max_codes_per_order"]
+                
+                if order_cnt >= max_codes:
+                    cardinal.send_message(chat_id, f"⚠️ Уже выдано {max_codes} кода. Лимит исчерпан.")
+                    processed[chat_id] = msg_id
+                    continue
+                
+                attempt = order_cnt + 1
+                
+                # Если IDLE активен - просто ждем в фоне
+                if idle_connection:
+                    cardinal.send_message(chat_id,
+                        f"🔍 Ожидание кода #{attempt}\n"
+                        f"📡 Мгновенная доставка (IDLE)"
+                    )
+                    active_searches[chat_id] = {
+                        "order_id": order_id, 
+                        "attempt": attempt,
+                        "start_time": time.time(), 
+                        "last_notify": 0,
+                        "notified": False
+                    }
+                    processed[chat_id] = msg_id
+                    continue
+                
+                code = fetch_code_fallback()
+                
+                if code:
+                    SETTINGS["order_code_counter"][order_id] = order_cnt + 1
+                    SETTINGS["issued_codes"][code] = {"time": datetime.now().strftime("%d.%m.%Y %H:%M:%S")}
+                    save_config()
+                    remaining = max_codes - order_cnt - 1
+                    
+                    start_session(chat_id)
+                    
+                    cardinal.send_message(chat_id,
+                        f"⚡ Код найден мгновенно!\n\n"
+                        f"🔐 Код #{attempt}: {code}\n\n"
+                        f"{'📥 Осталось попыток: '+str(remaining) if remaining > 0 else '⚠️ Попыток больше нет!'}\n\n"
+                        f"⏰ У вас 10 минут на вход в аккаунт."
+                    )
+                    processed[chat_id] = msg_id
+                    continue
+                
+                cardinal.send_message(chat_id,
+                    f"🔍 Поиск кода #{attempt}\n"
+                    f"⏱ Максимум 5 минут"
+                )
+                
+                active_searches[chat_id] = {
+                    "order_id": order_id, 
+                    "attempt": attempt,
+                    "start_time": time.time(), 
+                    "last_notify": 0,
+                    "notified": False
+                }
+                processed[chat_id] = msg_id
+            
+            # Проверяем активные сессии
+            check_sessions()
+            
+            if len(processed) > 100: 
+                processed = dict(list(processed.items())[-50:])
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"[SG] Ошибка: {e}")
+            time.sleep(2)
+
+# ============================================
+# ⏰ УПРАВЛЕНИЕ СЕССИЯМИ
+# ============================================
+
+def start_session(chat_id):
+    """Запускает сессию для клиента (10 минут)"""
+    SETTINGS["active_sessions"][str(chat_id)] = {
+        "start": time.time(),
+        "timeout": SETTINGS.get("session_timeout", 600),
+        "notified": False
+    }
+    save_config()
+
+def check_sessions():
+    """Проверяет активные сессии"""
+    now = time.time()
+    for chat_id, session in list(SETTINGS["active_sessions"].items()):
+        elapsed = now - session["start"]
+        timeout = session["timeout"]
+        
+        if elapsed > timeout - 60 and not session.get("notified"):
+            session["notified"] = True
+            save_config()
+            cardinal.send_message(int(chat_id),
+                f"⚠️ Внимание!\n\n"
+                f"У вас осталась 1 минута на настройку аккаунта.\n"
+                f"⏰ Сессия истекает через 60 секунд."
+            )
+        
+        if elapsed > timeout:
+            del SETTINGS["active_sessions"][chat_id]
+            save_config()
+            cardinal.send_message(int(chat_id),
+                f"⏰ Ваше время на настройку вышло!\n\n"
+                f"🔄 Для повторного входа запросите новый код командой SGC."
+            )
+            print(f"[SG] ⏰ Сессия для {chat_id} истекла")
+
+# ============================================
+# 📱 ИНТЕРФЕЙС
+# ============================================
+
+def show_menu(message):
+    mail_ok, mail_count = check_mail()
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'ВКЛ' if SETTINGS['active'] else 'ВЫКЛ'}",
+        callback_data="sg_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'🗑️' if SETTINGS.get('delete_after_use', True) else '📦'} Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}",
+        callback_data="sg_toggle_delete"
+    ))
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="sg_refresh"))
+    
+    text = (
+        f"🔐 SteamGuard Code v{VERSION} (Ultra)\n\n"
+        f"📧 {SETTINGS['imap_login']}\n"
+        f"{'🟢' if mail_ok else '🔴'} Почта: {'ОК' if mail_ok else 'Ошибка'}\n"
+        f"📬 Писем: {mail_count}\n"
+        f"🔢 Выдано кодов: {len(SETTINGS.get('issued_codes', {}))}\n"
+        f"🔍 Активных поисков: {len(active_searches)}\n"
+        f"👥 Активных сессий: {len(SETTINGS.get('active_sessions', {}))}\n"
+        f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'Активен' if SETTINGS['active'] else 'Отключён'}\n"
+        f"📡 IMAP IDLE: {'🟢 Активен' if idle_connection else '🔴 Ожидание'}\n"
+        f"🗑️ Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}\n\n"
+        f"💬 Команда: SGC (запрос кода)\n"
+        f"🧪 Команда: /test_sgk (диагностика)"
+    )
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+# ============================================
+# 🚀 ИНИЦИАЛИЗАЦИЯ
+# ============================================
+
+def init_plugin(c):
+    global cardinal, tg, bot, idle_thread_running
+    cardinal = c
+    tg = c.telegram
+    bot = c.telegram.bot
+    load_config()
+    
+    ok, count = check_mail()
+    print(f"[SteamGuard] {'✅' if ok else '❌'} Почта | Писем: {count}")
+    print(f"[SteamGuard] 📡 Запуск IMAP IDLE...")
+    
+    if not idle_thread_running:
+        idle_thread = threading.Thread(target=idle_worker, daemon=True)
+        idle_thread.start()
+        idle_thread_running = True
+        print(f"[SteamGuard] 📡 IDLE поток запущен")
+    
+    c.add_telegram_commands(UUID, [
+        ("sg", "🔐 SteamGuard", True),
+        ("test_sgk", "🧪 Тест писем Steam", True)
+    ])
+    tg.msg_handler(show_menu, commands=["sg"])
+    tg.msg_handler(test_steam_mail, commands=["test_sgk"])
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "sg_toggle")
+    def toggle(call):
+        SETTINGS["active"] = not SETTINGS["active"]
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "sg_toggle_delete")
+    def toggle_delete(call):
+        SETTINGS["delete_after_use"] = not SETTINGS.get("delete_after_use", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ВКЛ' if SETTINGS['delete_after_use'] else 'ВЫКЛ'}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "sg_refresh")
+    def refresh(call):
+        bot.answer_callback_query(call.id, "Обновляю...")
+        show_menu(call.message)
+    
+    threading.Thread(target=chat_scanner, daemon=True).start()
+    print(f"[SteamGuard v{VERSION}] ✅ Загружен. Ultra-режим активен!")
+
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_DELETE = None
