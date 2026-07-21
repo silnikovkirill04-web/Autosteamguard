@@ -31,7 +31,7 @@ SETTINGS = {
     "imap_host": "imap.gmail.com",
     "imap_port": 993,
     "imap_login": "silnikovkirill04@gmail.com",
-    "imap_password": "gotihysatnhmsowx",  # 🔥 ЗАМЕНИ НА НОВЫЙ ПАРОЛЬ ПРИЛОЖЕНИЯ!
+    "imap_password": "gotihysatnhmsowx",  # 🔥 ЗАМЕНИ НА НОВЫЙ ПАРОЛЬ ПОСЛЕ ТОГО КАК СДЕЛАЕШЬ РЕПОЗИТОРИЙ ПРИВАТНЫМ!
     "steam_sender": "noreply@steampowered.com",
     "active": True,
     "max_codes_per_order": 2,
@@ -126,7 +126,7 @@ def check_mail():
         return False, 0
 
 # ============================================
-# 🔥 ПОИСК КОДА (UNSEEN + УДАЛЕНИЕ)
+# 🔥 ПОИСК КОДА (UNSEEN + УДАЛЕНИЕ + FIX)
 # ============================================
 
 def fetch_code_by_time(request_timestamp):
@@ -141,7 +141,9 @@ def fetch_code_by_time(request_timestamp):
     try:
         # 🔥 Ищем ТОЛЬКО НЕПРОЧИТАННЫЕ письма
         _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
-        if not mail_ids[0]:
+        
+        # 🔥 ИСПРАВЛЕНИЕ: проверка на пустой байт
+        if not mail_ids or not mail_ids[0] or mail_ids[0] == b'':
             conn.close()
             conn.logout()
             return None
@@ -414,6 +416,7 @@ def init_plugin(c):
         print("[SG] ✅ Почта подключена")
     else:
         print("[SG] ❌ ПРОВЕРЬ ПАРОЛЬ ПРИЛОЖЕНИЯ! Google мог его заблокировать.")
+        print("[SG] ❌ ИЛИ СДЕЛАЙ РЕПОЗИТОРИЙ ПРИВАТНЫМ!")
     
     # Запуск очереди
     if not queue_worker_running:
