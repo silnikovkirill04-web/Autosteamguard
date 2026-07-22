@@ -1,6 +1,6 @@
 """
 SteamGuard Code v5.3 — Выдача Steam Guard по команде SGC (ULTRA)
-С полной защитой от смены почты, телефона и аутентификатора
+Настроен под письма Steam Guard
 """
 import uuid as uuid_lib
 import json
@@ -10,7 +10,6 @@ import email
 import re
 import time
 import threading
-import queue
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -35,7 +34,6 @@ SETTINGS = {
     "imap_password": "gotihysatnhmsowx",  # 🔥 ЗАМЕНИ НА НОВЫЙ ПАРОЛЬ
     "steam_sender": "noreply@steampowered.com",
     "active": True,
-    "search_timeout": 300,
     "delete_after_use": True,
     "mail_status": False,
     "mail_count": 0,
@@ -43,14 +41,13 @@ SETTINGS = {
     "issued_codes": {},
 }
 
-# 🔥 РАСШИРЕННЫЕ ФИЛЬТРЫ (ПОЛНАЯ ЗАЩИТА)
+# 🔥 ФИЛЬТРЫ (НАСТРОЕНЫ ПОД ПИСЬМА STEAM GUARD)
 BLOCKED_SUBJECTS = [
     "пароль", "password", "смена", "change", "reset", "сброс",
     "восстановление", "recovery", "удаление", "delete", "remove",
-    "почта", "email", "телефон", "phone", "номер", "number",
+    "почта", "email", "телефон", "phone",
     "привязка", "link", "отвязка", "unlink",
-    "аутентификатор", "authenticator", "мобильный аутентификатор",
-    "безопасность", "security", "блокировка", "block",
+    "аутентификатор", "authenticator",
     "двухфакторная", "two-factor", "2fa"
 ]
 
@@ -63,26 +60,18 @@ BLOCKED_BODY = [
     "отключить двухфакторную", "two-factor disabled",
 ]
 
+# 🔥 КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА КОДА
 GUARD_KEYWORDS = [
-    "steam guard", "код steam", "steam verification code",
-    "ваш код подтверждения steam", "steam guard code",
-    "вход", "login", "new device", "access your account",
-    "authorization code", "код авторизации"
+    "steam guard code",
+    "steam guard",
+    "access your account",
+    "log in from a new device",
+    "new device",
+    "verification code",
+    "steam guard code you need",
+    "login attempt",
+    "request made from"
 ]
-
-# 🔥 ОПАСНЫЕ ПАТТЕРНЫ
-DANGEROUS_PATTERNS = [
-    r"пароль.*изменен", r"password.*changed",
-    r"пароль.*сброшен", r"password.*reset",
-    r"почта.*изменена", r"email.*changed",
-    r"аккаунт.*удален", r"account.*deleted",
-    r"телефон.*удален", r"phone.*removed",
-    r"authenticator.*removed", r"two-factor.*disabled",
-]
-
-# 🔥 ОЧЕРЕДЬ
-sg_queue = queue.Queue()
-queue_worker_running = False
 
 # ============================================
 # 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
@@ -108,9 +97,6 @@ def save_config():
 
 def is_dangerous_email(body_lower, subject_lower):
     """Проверяет письмо на опасные действия"""
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, body_lower, re.IGNORECASE):
-            return True
     for phrase in BLOCKED_BODY:
         if phrase in body_lower:
             return True
@@ -155,7 +141,7 @@ def check_mail():
         return False, 0
 
 # ============================================
-# 🔥 ПОИСК КОДА
+# 🔥 ПОИСК КОДА (НАСТРОЕН ПОД ПИСЬМО)
 # ============================================
 
 def fetch_code():
@@ -200,21 +186,30 @@ def fetch_code():
                     conn.expunge()
                     continue
                 
-                # Ищем код
-                codes = re.findall(r"\b[A-Z0-9]{5}\b", body)
+                # 🔥 Ищем 5-значный код
+                code_match = re.search(r'\b([A-Z0-9]{5})\b', body)
                 
-                if codes and any(kw in body_lower for kw in GUARD_KEYWORDS):
-                    code = codes[0].upper()
-                    print(f"[SG] 🎉 КОД НАЙДЕН: {code}")
+                if code_match:
+                    code = code_match.group(1).upper()
+                    print(f"[SG] 🔐 Найден код: {code}")
                     
-                    if SETTINGS.get("delete_after_use", True):
-                        conn.store(mail_id, "+FLAGS", "\\Deleted")
-                        conn.expunge()
-                        print(f"[SG] 🗑️ Письмо с кодом {code} УДАЛЕНО")
-                    
-                    conn.close()
-                    conn.logout()
-                    return code
+                    # 🔥 Проверяем ключевые слова
+                    if any(kw in body_lower for kw in GUARD_KEYWORDS):
+                        print(f"[SG] ✅ Ключевые слова найдены")
+                        print(f"[SG] 🎉 КОД НАЙДЕН: {code}")
+                        
+                        if SETTINGS.get("delete_after_use", True):
+                            conn.store(mail_id, "+FLAGS", "\\Deleted")
+                            conn.expunge()
+                            print(f"[SG] 🗑️ Письмо с кодом {code} УДАЛЕНО")
+                        
+                        conn.close()
+                        conn.logout()
+                        return code
+                    else:
+                        print(f"[SG] ⚠️ Код есть, но нет ключевых слов")
+                else:
+                    print(f"[SG] ❌ Код не найден в письме")
                     
             except Exception as e:
                 print(f"[SG] ❌ Ошибка обработки письма: {e}")
@@ -234,34 +229,47 @@ def fetch_code():
         return None
 
 # ============================================
-# 🔄 ОБРАБОТКА SGC (БЕЗ ЛИМИТА)
+# 🔄 ОБРАБОТКА SGC (С ЦИКЛОМ ОЖИДАНИЯ)
 # ============================================
 
 def process_sgc(chat_id, msg_id):
-    """Обработка запроса SGC - БЕЗ ЛИМИТА ПОПЫТОК"""
-    print(f"[SG] 📥 Запрос SGC от {chat_id}")
+    """Обработка запроса SGC с автоматическим ожиданием письма"""
+    print(f"[SG] 📥 Запуск ожидания кода для чата {chat_id}")
+    cardinal.send_message(chat_id, "⏳ Проверяю почту, ожидайте код...")
     
-    # Сразу ищем код
-    code = fetch_code()
+    start_time = time.time()
+    timeout = 180  # Ждем максимум 3 минуты
+    check_interval = 6  # Проверка каждые 6 секунд
+    last_notify = 0
     
-    if code:
-        SETTINGS["issued_codes"][code] = {
-            "time": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-            "chat_id": chat_id
-        }
-        save_config()
+    while time.time() - start_time < timeout:
+        code = fetch_code()
+        if code:
+            SETTINGS["issued_codes"][code] = {
+                "time": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                "chat_id": chat_id
+            }
+            save_config()
+            cardinal.send_message(chat_id, f"🎉 Код найден!\n\n🔐 Код: {code}")
+            print(f"[SG] ✅ Код {code} успешно выдан {chat_id}")
+            return True
         
-        cardinal.send_message(chat_id,
-            f"🎉 Код найден!\n\n"
-            f"🔐 Код: {code}"
-        )
-        print(f"[SG] ✅ Код {code} отправлен {chat_id}")
-    else:
-        cardinal.send_message(chat_id,
-            f"❌ Код не найден.\n"
-            f"🔄 Попробуйте еще раз через 10 секунд."
-        )
-        print(f"[SG] ❌ Код не найден для {chat_id}")
+        # Уведомление каждые 30 секунд
+        elapsed = int(time.time() - start_time)
+        if elapsed - last_notify >= 30:
+            last_notify = elapsed
+            remaining = int((timeout - elapsed) / 60)
+            if remaining > 1:
+                cardinal.send_message(chat_id, f"⏳ Ждем код... {remaining} минут осталось")
+            elif remaining == 1:
+                cardinal.send_message(chat_id, f"⏳ Ждем код... 1 минута осталась")
+            
+        time.sleep(check_interval)
+    
+    # Если за 3 минуты ничего не пришло
+    cardinal.send_message(chat_id, "❌ Код не пришел от Steam. Пожалуйста, попробуйте войти заново и написать SGC.")
+    print(f"[SG] ❌ Таймаут ожидания кода для {chat_id}")
+    return False
 
 # ============================================
 # 🔄 СКАНЕР ЧАТОВ
@@ -315,7 +323,7 @@ def chat_scanner():
                     continue
                 
                 print(f"[SG] 🔔 SGC от {chat_id}")
-                process_sgc(chat_id, msg_id)
+                threading.Thread(target=process_sgc, args=(chat_id, msg_id), daemon=True).start()
                 processed[chat_id] = msg_id
                 
                 try:
@@ -357,7 +365,8 @@ def show_menu(message):
         f"🔢 Выдано кодов: {len(SETTINGS.get('issued_codes', {}))}\n"
         f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'Активен' if SETTINGS['active'] else 'Отключён'}\n"
         f"🗑️ Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}\n"
-        f"🛡️ Защита: ПОЛНАЯ\n\n"
+        f"🛡️ Защита: ПОЛНАЯ\n"
+        f"⏳ Ожидание: до 3 минут\n\n"
         f"💬 Команда: SGC"
     )
     cardinal.send_message(message.chat.id, text, reply_markup=kb)
@@ -367,7 +376,7 @@ def show_menu(message):
 # ============================================
 
 def init_plugin(c):
-    global cardinal, tg, bot, queue_worker_running
+    global cardinal, tg, bot
     cardinal = c
     tg = c.telegram
     bot = c.telegram.bot
@@ -375,7 +384,8 @@ def init_plugin(c):
     print("=" * 60)
     print("[SG] 🔐 ЗАГРУЗКА SteamGuard Code v5.3")
     print("[SG] 🛡️ ПОЛНАЯ ЗАЩИТА АКТИВИРОВАНА")
-    print("[SG] ♾️ ЛИМИТ ПОПЫТОК ОТКЛЮЧЕН")
+    print("[SG] ⏳ РЕЖИМ ОЖИДАНИЯ: 3 МИНУТЫ")
+    print("[SG] 📧 ФИЛЬТРЫ НАСТРОЕНЫ ПОД STEAM GUARD")
     print("=" * 60)
     
     load_config()
@@ -412,9 +422,10 @@ def init_plugin(c):
     
     print("=" * 60)
     print("[SG] ✅ ПЛАГИН ЗАГРУЖЕН!")
-    print("[SG] 📌 SGC — запрос кода (БЕЗ ЛИМИТА)")
+    print("[SG] 📌 SGC — запрос кода (ожидание до 3 минут)")
     print("[SG] 📌 /sg — меню")
     print("[SG] 🛡️ Защита от смены почты, телефона, аутентификатора")
+    print("[SG] 🔍 Ищет код в письмах с 'Steam Guard'")
     print("=" * 60)
 
 BIND_TO_PRE_INIT = [init_plugin]
