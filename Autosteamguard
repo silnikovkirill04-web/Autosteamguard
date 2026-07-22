@@ -1,433 +1,421 @@
-💎БАЗА АККАУНТОВ STEAM С ИГРАМИ💎
-‼️НЕКОТОРЫЕ АККАУНТЫ МОГУТ НЕ РАБОТАТЬ ИЛИ НА НИХ МОЖЕТ СТОЯТЬ STEAM GUARD, ЭТО НОРМАЛЬНО, ИЩИТЕ НУЖНУЮ ИГРУ НА ДРУГИХ АККАУНТАХ‼️
+"""
+SteamGuard Code v5.3 — Выдача Steam Guard по команде SGC (ULTRA)
+С полной защитой от смены почты, телефона и аутентификатора
+"""
+import uuid as uuid_lib
+import json
+import os
+import imaplib
+import email
+import re
+import time
+import threading
+import queue
+from datetime import datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+NAME = "SteamGuard Code"
+VERSION = "5.3.0"
+DESCRIPTION = "Выдача Steam Guard по команде SGC (Ultra)"
+CREDITS = "@qneiz"
+UUID = str(uuid_lib.uuid4())
+SETTINGS_PAGE = False
 
-⚡️Если у вас ошибка 50, то пробуйте зайти в аккаунт 15 минут, если не поможет, то перезагрузите ПК и повторите попытку!
+CONFIG_PATH = "storage/cache/steamguard_config.json"
 
+cardinal = None
+tg = None
+bot = None
 
-‼️На аккаунтах зачастую больше одной игры‼️
+# 🔥 НАСТРОЙКИ
+SETTINGS = {
+    "imap_host": "imap.gmail.com",
+    "imap_port": 993,
+    "imap_login": "silnikovkirill04@gmail.com",
+    "imap_password": "gotihysatnhmsowx",  # 🔥 ЗАМЕНИ НА НОВЫЙ ПАРОЛЬ
+    "steam_sender": "noreply@steampowered.com",
+    "active": True,
+    "search_timeout": 300,
+    "delete_after_use": True,
+    "mail_status": False,
+    "mail_count": 0,
+    "mail_last_check": "",
+    "issued_codes": {},
+}
 
+# 🔥 РАСШИРЕННЫЕ ФИЛЬТРЫ (ПОЛНАЯ ЗАЩИТА)
+BLOCKED_SUBJECTS = [
+    "пароль", "password", "смена", "change", "reset", "сброс",
+    "восстановление", "recovery", "удаление", "delete", "remove",
+    "почта", "email", "телефон", "phone", "номер", "number",
+    "привязка", "link", "отвязка", "unlink",
+    "аутентификатор", "authenticator", "мобильный аутентификатор",
+    "безопасность", "security", "блокировка", "block",
+    "двухфакторная", "two-factor", "2fa"
+]
 
-👾АККАУНТЫ👾
-Tiny Bunny все части, R.E.P.O., Dead Cells, Ведьмак 3, Hitman 3 + 100 игр
-👤Логин: 8wlztapigfczqyb6wm1y
-🔑Пароль: TeqwnryqE124hrqw12
-Resident Evil Requiem, FC 26, REANIMAL, Fears To Fathom + 10 игр
-👤Логин: goshabogrov_1980
-🔑Пароль: Lka0!_da
+BLOCKED_BODY = [
+    "сменить пароль", "change password", "reset password",
+    "удалить аккаунт", "delete account", "remove account",
+    "сменить почту", "change email", "update email",
+    "привязать телефон", "add phone", "удалить телефон", "remove phone",
+    "отключить аутентификатор", "authenticator removed",
+    "отключить двухфакторную", "two-factor disabled",
+]
 
+GUARD_KEYWORDS = [
+    "steam guard", "код steam", "steam verification code",
+    "ваш код подтверждения steam", "steam guard code",
+    "вход", "login", "new device", "access your account",
+    "authorization code", "код авторизации"
+]
 
+# 🔥 ОПАСНЫЕ ПАТТЕРНЫ
+DANGEROUS_PATTERNS = [
+    r"пароль.*изменен", r"password.*changed",
+    r"пароль.*сброшен", r"password.*reset",
+    r"почта.*изменена", r"email.*changed",
+    r"аккаунт.*удален", r"account.*deleted",
+    r"телефон.*удален", r"phone.*removed",
+    r"authenticator.*removed", r"two-factor.*disabled",
+]
 
-The Last of Us Part 2 Remastered, Asseto Corsa, BeamNG.Drive + 20 игр
-👤Логин: akkfun123
-🔑Пароль: rlaxe90993
+# 🔥 ОЧЕРЕДЬ
+sg_queue = queue.Queue()
+queue_worker_running = False
 
+# ============================================
+# 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
+# ============================================
 
+def load_config():
+    global SETTINGS
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                for k in loaded:
+                    if k in SETTINGS:
+                        SETTINGS[k] = loaded[k]
+    except: pass
 
-Resident Evil Requiem
-👤Логин: hqhmq15120
-🔑Пароль: yhcga08962
+def save_config():
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
+    except: pass
 
+def is_dangerous_email(body_lower, subject_lower):
+    """Проверяет письмо на опасные действия"""
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, body_lower, re.IGNORECASE):
+            return True
+    for phrase in BLOCKED_BODY:
+        if phrase in body_lower:
+            return True
+    for word in BLOCKED_SUBJECTS:
+        if word in subject_lower:
+            return True
+    return False
 
+# ============================================
+# 📧 РАБОТА С ПОЧТОЙ
+# ============================================
 
-METRO все части
-👤Логин: bpvre38210
-🔑Пароль: efmoj86362
+def get_imap():
+    try:
+        conn = imaplib.IMAP4_SSL(SETTINGS["imap_host"], SETTINGS["imap_port"], timeout=15)
+        conn.login(SETTINGS["imap_login"], SETTINGS["imap_password"])
+        conn.select("INBOX")
+        return conn
+    except Exception as e:
+        print(f"[SG] ❌ Ошибка подключения: {e}")
+        return None
 
+def check_mail():
+    try:
+        conn = get_imap()
+        if not conn:
+            return False, 0
+        _, mails = conn.search(None, "ALL")
+        count = len(mails[0].split()) if mails[0] else 0
+        conn.close()
+        conn.logout()
+        SETTINGS["mail_status"] = True
+        SETTINGS["mail_count"] = count
+        SETTINGS["mail_last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        save_config()
+        print(f"[SG] ✅ Почта: {count} писем")
+        return True, count
+    except Exception as e:
+        print(f"[SG] ❌ Ошибка проверки почты: {e}")
+        SETTINGS["mail_status"] = False
+        save_config()
+        return False, 0
 
+# ============================================
+# 🔥 ПОИСК КОДА
+# ============================================
 
-Все части Poppy Playtime
-👤Логин: poppyxiajsh
-🔑Пароль: playerok.com/profile/QAVIX
-Все части Poppy Playtime
-👤Логин: buldozer311522
-🔑Пароль: 1029384756Va!24
+def fetch_code():
+    """Поиск кода в непрочитанных письмах от Steam"""
+    conn = get_imap()
+    if not conn:
+        return None
+    
+    try:
+        _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
+        
+        if not mail_ids or not mail_ids[0] or mail_ids[0] == b'':
+            conn.close()
+            conn.logout()
+            return None
+        
+        print(f"[SG] 📬 Найдено {len(mail_ids[0].split())} новых писем от Steam")
+        
+        for mail_id in reversed(mail_ids[0].split()[-5:]):
+            try:
+                _, raw = conn.fetch(mail_id, "(RFC822)")
+                mail_obj = email.message_from_bytes(raw[0][1])
+                
+                subject = mail_obj.get("Subject", "Без темы")
+                subject_lower = subject.lower()
+                
+                body = ""
+                if mail_obj.is_multipart():
+                    for part in mail_obj.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                            break
+                else:
+                    body = mail_obj.get_payload(decode=True).decode("utf-8", errors="ignore")
+                
+                body_lower = body.lower()
+                
+                # Проверка на опасность
+                if is_dangerous_email(body_lower, subject_lower):
+                    print(f"[SG] 🚫 Опасное письмо: {subject[:50]}")
+                    conn.store(mail_id, "+FLAGS", "\\Deleted")
+                    conn.expunge()
+                    continue
+                
+                # Ищем код
+                codes = re.findall(r"\b[A-Z0-9]{5}\b", body)
+                
+                if codes and any(kw in body_lower for kw in GUARD_KEYWORDS):
+                    code = codes[0].upper()
+                    print(f"[SG] 🎉 КОД НАЙДЕН: {code}")
+                    
+                    if SETTINGS.get("delete_after_use", True):
+                        conn.store(mail_id, "+FLAGS", "\\Deleted")
+                        conn.expunge()
+                        print(f"[SG] 🗑️ Письмо с кодом {code} УДАЛЕНО")
+                    
+                    conn.close()
+                    conn.logout()
+                    return code
+                    
+            except Exception as e:
+                print(f"[SG] ❌ Ошибка обработки письма: {e}")
+                continue
+        
+        conn.close()
+        conn.logout()
+        return None
+        
+    except Exception as e:
+        print(f"[SG] ❌ Критическая ошибка: {e}")
+        try:
+            conn.close()
+            conn.logout()
+        except:
+            pass
+        return None
 
+# ============================================
+# 🔄 ОБРАБОТКА SGC (БЕЗ ЛИМИТА)
+# ============================================
 
-God of War (2018) + GoW Ragnarök (2024)
-👤Логин: krishurt9p
-🔑Пароль: wTrekfan66!vrz
-Forza Horizon 4
-👤Логин: shiyarff1
-🔑Пароль: Gejskizywhjqk!
-The Last of Us Part II
-👤Логин: rastyachap
-🔑Пароль: Ezskydream1
+def process_sgc(chat_id, msg_id):
+    """Обработка запроса SGC - БЕЗ ЛИМИТА ПОПЫТОК"""
+    print(f"[SG] 📥 Запрос SGC от {chat_id}")
+    
+    # Сразу ищем код
+    code = fetch_code()
+    
+    if code:
+        SETTINGS["issued_codes"][code] = {
+            "time": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+            "chat_id": chat_id
+        }
+        save_config()
+        
+        cardinal.send_message(chat_id,
+            f"🎉 Код найден!\n\n"
+            f"🔐 Код: {code}"
+        )
+        print(f"[SG] ✅ Код {code} отправлен {chat_id}")
+    else:
+        cardinal.send_message(chat_id,
+            f"❌ Код не найден.\n"
+            f"🔄 Попробуйте еще раз через 10 секунд."
+        )
+        print(f"[SG] ❌ Код не найден для {chat_id}")
 
-My Winter Car + My Summer Car
-👤Логин: hros1kshopp
-🔑Пароль: Hros1kShop!1
+# ============================================
+# 🔄 СКАНЕР ЧАТОВ
+# ============================================
 
+def chat_scanner():
+    processed = {}
+    print("[SG] 🛰 Сканер чатов запущен")
+    print("[SG] 📡 Ожидание команд SGC...")
+    
+    while True:
+        if not SETTINGS["active"]:
+            time.sleep(1)
+            continue
+        try:
+            chats = cardinal.account.get_chats(update=True)
+            
+            if not chats:
+                time.sleep(1)
+                continue
+            
+            for chat_id, chat in chats.items():
+                if not chat.unread:
+                    continue
+                
+                try:
+                    msgs = cardinal.account.get_chat_history(chat_id)
+                except Exception as e:
+                    print(f"[SG] ❌ Ошибка истории {chat_id}: {e}")
+                    continue
+                
+                if not msgs:
+                    continue
+                
+                buyer_text = ""
+                msg_id = 0
+                for msg in reversed(msgs):
+                    if hasattr(msg, "author_id") and msg.author_id not in (cardinal.account.id, 0):
+                        if msg.text and msg.text.strip():
+                            buyer_text = msg.text.strip()
+                            msg_id = msg.id
+                            break
+                
+                if not buyer_text:
+                    continue
+                
+                if buyer_text.upper().strip() != "SGC":
+                    continue
+                
+                if chat_id in processed and processed[chat_id] >= msg_id:
+                    continue
+                
+                print(f"[SG] 🔔 SGC от {chat_id}")
+                process_sgc(chat_id, msg_id)
+                processed[chat_id] = msg_id
+                
+                try:
+                    if hasattr(cardinal.account, 'mark_as_read'):
+                        cardinal.account.mark_as_read(chat_id)
+                except Exception as e:
+                    print(f"[SG] ⚠️ Не удалось пометить как прочитанное: {e}")
+            
+            if len(processed) > 100:
+                processed = dict(list(processed.items())[-50:])
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"[SG] ❌ Ошибка сканера: {e}")
+            time.sleep(2)
 
-My summer car + 60 игр
-👤Логин: opgarpstore1
-🔑Пароль: fMZ%=5mZ'<~Z6XV
+# ============================================
+# 📱 ИНТЕРФЕЙС
+# ============================================
 
+def show_menu(message):
+    mail_ok, mail_count = check_mail()
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'ВКЛ' if SETTINGS['active'] else 'ВЫКЛ'}",
+        callback_data="sg_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'🗑️' if SETTINGS.get('delete_after_use', True) else '📦'} Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}",
+        callback_data="sg_toggle_delete"
+    ))
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="sg_refresh"))
+    
+    text = (
+        f"🔐 SteamGuard Code v{VERSION}\n\n"
+        f"📧 {SETTINGS['imap_login']}\n"
+        f"{'🟢' if mail_ok else '🔴'} Почта: {'ОК' if mail_ok else 'Ошибка'}\n"
+        f"📬 Писем: {mail_count}\n"
+        f"🔢 Выдано кодов: {len(SETTINGS.get('issued_codes', {}))}\n"
+        f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'Активен' if SETTINGS['active'] else 'Отключён'}\n"
+        f"🗑️ Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}\n"
+        f"🛡️ Защита: ПОЛНАЯ\n\n"
+        f"💬 Команда: SGC"
+    )
+    cardinal.send_message(message.chat.id, text, reply_markup=kb)
 
-Mortal Kombat 11
-👤Логин: egor_pomidor91
-🔑Пароль: !UsEdRuGs3!
+# ============================================
+# 🚀 ИНИЦИАЛИЗАЦИЯ
+# ============================================
 
-BeamNG.drive
-👤Логин: uoorf89087 
-🔑Пароль: fxzer58595
-Mafia: The Old Country
-👤 Логин: xziwoqpww
-🔑 Пароль: School317
-Doom Eternal
-👤Логин: fresh6y
-🔑Пароль: !Q~;.Cz!EQu"4KJ
-PEAK
-👤Логин: yeguh72371
-🔑Пароль: HEUEHEGIAPGPHKIHEITYT^REHhtr
-Ghost of Tsushima
-👤Логин: owdzl85179
-🔑Пароль: dfyep12227
+def init_plugin(c):
+    global cardinal, tg, bot, queue_worker_running
+    cardinal = c
+    tg = c.telegram
+    bot = c.telegram.bot
+    
+    print("=" * 60)
+    print("[SG] 🔐 ЗАГРУЗКА SteamGuard Code v5.3")
+    print("[SG] 🛡️ ПОЛНАЯ ЗАЩИТА АКТИВИРОВАНА")
+    print("[SG] ♾️ ЛИМИТ ПОПЫТОК ОТКЛЮЧЕН")
+    print("=" * 60)
+    
+    load_config()
+    
+    ok, count = check_mail()
+    if ok:
+        print("[SG] ✅ Почта подключена")
+    else:
+        print("[SG] ❌ ПРОВЕРЬ ПАРОЛЬ ПРИЛОЖЕНИЯ!")
+    
+    c.add_telegram_commands(UUID, [("sg", "🔐 SteamGuard", True)])
+    tg.msg_handler(show_menu, commands=["sg"])
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "sg_toggle")
+    def toggle(call):
+        SETTINGS["active"] = not SETTINGS["active"]
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "sg_toggle_delete")
+    def toggle_delete(call):
+        SETTINGS["delete_after_use"] = not SETTINGS.get("delete_after_use", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ВКЛ' if SETTINGS['delete_after_use'] else 'ВЫКЛ'}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "sg_refresh")
+    def refresh(call):
+        bot.answer_callback_query(call.id, "Обновляю...")
+        show_menu(call.message)
+    
+    threading.Thread(target=chat_scanner, daemon=True).start()
+    
+    print("=" * 60)
+    print("[SG] ✅ ПЛАГИН ЗАГРУЖЕН!")
+    print("[SG] 📌 SGC — запрос кода (БЕЗ ЛИМИТА)")
+    print("[SG] 📌 /sg — меню")
+    print("[SG] 🛡️ Защита от смены почты, телефона, аутентификатора")
+    print("=" * 60)
 
-Tiny Bunny, Cyberpunk 2077, Ведьмак 3, The Sims 4, Outlast 1 и 2, Metro Exodus
-
-👤Логин: patriciamurphy1992
-🔑Пароль: Fosjk92593OIASD
-
-
-Elden Ring + Sons of the Forest
-👤Логин: oiqx1
-🔑Пароль: i@u@up3C8k#A
-Red Dead Redemption 2
-👤Логин: lwbh89436
-🔑Пароль: Steam-steam-Mluiggi1234Azer!
-Wallpaper Engine
-👤Логин: uu5fe9hz7wd8
-🔑Пароль: S3BAKKBK62S8
-
-
-Аккаунт с BeamNG.drive, Garrys Mod, Hearts of Iron IV
-👤Логин: beamngg34
-🔑Пароль: playerok.com/profile/QAVIX
-Resident evil 2, Outlast 2, Raft, Elden Ring, Miside, The Witcher 3, Black myth: wukong, Atomic Heart, Mafia the old country, Mafia II, Little Nightmares, Sons of the forest, Spider-Man remastered, 7 days to die, все части dark souls, все части Mafia, Spider-Man 2, Spider-Man miles morales, portal 2
-👤Логин: donateriya
-🔑Пароль: 5uy-Tus-3xS-Bmk
-
-Hitman 3 части, Lethal Company, Buckshot Roulette, Half-Life, Left 4 Dead, Metro, Geometry Dash
-👤Логин: hfovr12719
-🔑Пароль: danvq79387
-Black Myth: Wukong
-👤Логин: truelover2018
-🔑Пароль: GhosTWukong_0
-R.E.P.O.
-👤 Логин: tyypv07695
-🔑 Пароль: WvbFGG456DV
-💎Много разных игр💎
-Логин: JaraxovAnton
-Пароль: Iphone783
-I'M NOT A HUMAN:
-👤 Логин:uuxxc18258
-🔑 Пароль:pfgtf72720
-Five Nights at Freddy's: Secret of the Mimic:
-👤 Логин: fredglover1960
-🔑 Пароль: nqszzger9229$!1v0
-Schedule I
-👤 Логин: cazca412520
-🔑 Пароль: IlPrF946278
-Mortal Kombat 11 Mortal Kombat X Forza Horizon 5
-👤Логин:qqq2549
-🔑Пароль:playerok.com/profile/QAVIX (ссылка и есть пароль)
-Euro Truck Simulator 2 Assetto corsa 
-👤логин:ets2xiajsh
-🔑пароль: https://playerok.com/profile/QAVIX/products  (ссылка и есть пароль)
-DOOM:
-👤Логин: redh00dgaming300gier 
-🔑Пароль: k0NTo_na1ezyDORedHooDgaming99_Allegro
-👤Логин: juantrezza8
-🔑Пароль: ZZZZZrr1312
-Mafia: The Old Country:
-👤 Логин: lifmp13366
-🔑 Пароль: cbsj62484J
-MISIDE:
-👤 Логин: cyberhitler1488
-🔑 Пароль: Huiacbau@Y@FC0a9C
-CUPHEAD:
-👤 Логин: gozadinhodaquebrada
-🔑 Пароль: 00998877Sa
-Mortal Kombat 1
-👤логин: unaccustomedsle
-🔑пароль: playerokTovarStoreMK
-ATOMIC HEART:
-👤Логин: android_gamer228 
-🔑Пароль: ZZZZZrr1341
-CYBERPUNK 2077:
-👤 Логин: 31chap31
-🔑 Пароль: 09090828Lm
-BeamNG:
-👤 Логин: ruhan667
-🔑 Пароль: Ikon1900
-FORZA HORIZON 4-5:
-👤 Логин: bejwc
-🔑 Пароль: aA102020
-👤 Логин: zp0uu0cc2ip8
-🔑 Пароль: F693B23CBFKM
-👤 Логин: AEGplayerok44games
-🔑 Пароль: playeRokaeg03
-RUST:
-👤Логин: zach1764362
-🔑Пароль: 4vbcwcwn
-BLACK MYTH: WUKONG DELUX
-👤 Логин: tazrs41035
-🔑 Пароль: ibwe69388M
-GOD OF WAR:
-👤 Логин: cretosesat1971 
-🔑 Пароль: JYQaFwd7zh
-👤 Логин: godofwarsteam123
-🔑 Пароль: AYA558r!rroiH83
-AMONG US:
-👤 Логин: emablanco710
-🔑 Пароль: Ema50121097
-DYING LIGHT THE BEST,1,2:
-👤 Логин: hansenp9119
-🔑 Пароль: xB3d23~T_c
-👤 Логин: wiireamorsand1989
-🔑 Пароль: cefmul0q8J1982
-👤 Логин: hansenp9119
-🔑 Пароль: xB3d23~T_c
-👤 Логин: and_tr0kh
-🔑 Пароль: Johanledieu28
-SPIDER MAN2:
-👤 Логин: sortalcreel1582
-🔑 Пароль: gHOSTgAME00
-👤 Логин: jeanhugor 
-🔑 Пароль: boduyashops7
-👤 Логин: ubpjc70623
-🔑 Пароль: 2trwxf23958
-👤Логин - aristocrat628 
-🔑Пароль - gg634fbdfh
-👤Логин: pe2wchzfb 
-🔑Пароль: 1w4ousv8a
-👤Логин: NEW2SPIDERSMANOFF581
-🔑Пароль: jMc3rP#=lBu\{43fz{-v
-INZOI:
- 👤 Логин: fp_helium_4
-🔑 Пароль: HyR-8et-X9u-nDU
-Poppy Playtime (1 + 2 + 3, 4)
-👤 Логин: aeg_playerokpoppy
-🔑 Пароль: AEGplayerok.com9738f
-👤Логин: Playerok_LuckyLlore 
-🔑Пароль: fy7f8dtfd7s!fds
-ASSASIN CREED SHADOWS:
-1)👤Account: bxwba85822
-🔑Password: cabed03913
-📌 Call of Duty: Infinite Warfare
-Логин: maxiek_d
-Пароль: ZZZZZrr1310
-📌Call of Duty Ghosts 
-Логин: itsqou
-Пароль: ZZZZZrr1310
-📌 Call of Duty Black Ops (2010)
-Логин: dorstroi
-Пароль: Ena0930ad
-📌 Call of Duty Ghosts
-Логин: raron2006 
-Пароль: lolitude 
-📌 Call of Duty: WWII
-Логин: victorinox156 
-Пароль: ZZZZZrr1310
-📌 Call of Duty: World at War
-Логин: rychard31 
-Пароль: 773ZA7B7XF5G
-📌 Call of Duty: United Offensive
-Логин: bootiechavis 
-Пароль: 01.22.25r
-📌 Call of Duty: Modern Warfare 2
-Логин: 6220292
-Пароль: 0JMWfOj--oZl
-📌 Call of Duty Modern Warfare 3
-Логин: pain_jaren
-Пароль: ZZZZZrr139
-📌 Call of Duty Modern warfare 
-Логин: exorsistbr
-Пароль: afq@exuvima
-📌 Call of Duty Black Ops 
-Логин: benny37de
-Пароль: ZZZZZrr139
-📌 Call of Duty Black Ops 2
-Логин: noe20003
-Пароль: ZZZZZrr139
-📌 Call of Duty®: Black Ops Cold War
-Логин: dtmhm190166
-Пароль: ZZZZZrr1310
-📌 Call of Duty Modern Warfare 3 
-Логин: dorstroi
-Пароль: Ena0930ad
-📌 Call of Duty MW 2019
-логин: penguinwithdepthd 
-пароль: ZZZZZrr1341
-📌 Call of Duty 2
-Логин: efoxpl3247
-Пароль: ZZZZZrr1315
-📌 Call of Duty: Ghosts
-Логин: rysso1
-Пароль: POBu59wIQa
-📌 Call of Duty: Modern Warfare 2
- Логин: lucienne02 
-Пароль: TZEKZ7XA4EFG
-Letal Company
-Логин: dotori120515
-Пароль: BulbulofficialFP
-Cyberpunk 2077 + Phantom Liberty
-Логин: i_kh0qMljf
-Пароль: e0y0Z3_xll
-RAFT
-Логин: gabsalsem
-Пароль: gabriel2502
-MiSide
-Логин: MiSideSteam
-Пароль: rwbAFGAcwn8834
-SpiderMan 2
-Логин: aristocrat628
-Пароль: gg634fbdfh
-Forza horizon 4+5, The Forest, assetto corsa, beamNG.drive, Cyberpunk 2077, dying light, euro truck simulator 2, Half-life 2, Все Метро, the Forest, OutLast 2
-Логин: tzhek38998
-Пароль: vtwxu50971
-Schedule I
-Логин: wfbn25958
-Пароль: Zc3Ng9Nn0Hx16t
-ARK: Survival Evolved
-Логин: alihu2sein
-Пароль: alimm2001
-No i'm not a human
-Логин: autoplaysteam
-Пароль: ABOBA.COM123
-📌 Аккаунты с Spider-Man 2:
-• Логин - aristocrat628 Пароль - gg634fbdfh
-📌 Аккаунты с Atomic Heart (STEAM): 📌 Основной аккаунт без GUARD (Steam) 📌 Логин: android_gamer228 Пароль: ZZZZZrr1341
-📌 Аккаунт с R.E.P.O:
-• Логин: toper_lucky Пароль: luckyllore_pl_repo
-📌 Аккаунт с INZOI:
-• Логин: fp_helium_4 пароль: HyR-8et-X9u-nDU
-📌 Аккаунт с TLOU 2 (может быть ошибка 50 или 5 из-за очереди. Решение - перезаходить беспрерывно в течении 3-5 минут):
-• Логин: maffolina Пароль:
-retii1337+
-📌 Аккаунт с Schedule I:
-• Логин: 227kybik227 Пароль: e2P#*Y%81idv#5E0
-📌 Аккаунт с Poppy Playtime (1-4 часть):
-• Логин: Playerok_LuckyLlore Пароль: fy7f8dtfd7s!fds
-📌 Аккаунт с Miside:
-• Логин: cyberhitler1488 Пароль: Huiacbau@Y@FC0a9C
-📌 Аккаунт с Hogwarts Legacy:
-• Логин: djaja131415 Пароль: Android429
-📌 Аккаунты с Among Us + 15 игр:
-• В процессе замены
-📌 Аккаунты с SCUM, PayDay 2:
-• Логин: meliodass544 Пароль: Ka112233
-📌 Аккаунты с Metro 2033 (2010)
- • Логин: goga121212 Пароль: 6AGF7GG2ADFA
-📌 Аккаунты с Metro: Last Light (2013)
- • Логин: dvdmix Пароль: OLIV!E1R!1N2E!FF!EX|FP
-📌 Аккаунты с Metro Redux (2014)
-• Логин: dvdmix Пароль: OLIV!E1R!1N2E!FF!EX|FP
-📌 Аккаунты с «Metro Exodus» (2019)
- • Логин: fomenkom2 Пароль: 13579zef
-📌:
-• Логин: mvdtd44365 Пароль: eomlv10571
-📌 Аккаунты с Spider-Man Remastered, Spider-Man Miles Morales:
-• Логин: jeanhugor Пароль: boduyashops7
-📌 Аккаунты с My Summer Car + 30 игр:
-• Логин: pe2wchzfb Пароль: 1w4ousv8a
-📌 Аккаунты с RDR2:
-• Логин: frances_heck2010 Пароль: 4a2-cVm-QyD-tUn
-📌 Аккаунты с Raft:
-• Логин: cwy199611 Пароль: Bejdw89611
-📌 Аккаунты с BeamNG:
-• Логин: firefox12396 Пароль: U$sE2B0O88!$r
-📌 Аккаунты с Dying Light 2:
-• Логин: ojiuc43222 Пароль: memesan5253A
-📌 Аккаунты с TearDown:
-• Логин: fycucotaw Пароль: siski337843556nchDDIock645b087
-📌 Аккаунты с Mortal Kombat 11:
-• Логин: Zalyuner Пароль: Jhvghdha4
-📌 Аккаунты с Mortal Kombat 10:
-• Логин: leo3d3 Пароль: tricolor231002 
-📌 Аккаунты с Phasmophobia:
-• Логин: firefox12396 Пароль: U$sE2B0O88!$r
-📌 Аккаунты с Stray:
-• Логин: wbtq1088322 Пароль: steamok4566H
-📌 Аккаунты с The Witcher 3:
-• Логин - vu8nz7so0zn6 , пароль - EKT825K2X5T8
-📌 Аккаунты с Forza Horizon 5:
-• Логин: zp0uu0cc2ip8 Пароль: F693B23CBFKM
-📌 Аккаунты с The Last Of Us:
-• Логин: bridgetturner1e Пароль: HWfdg354hfgdDFH
-📌 Аккаунты с Black Myth Wukong:
-• Логин: 96850813 Пароль: Derkytt090934
-📌 Аккаунты с Sons Of The Forest:
-• Логин: alinechetelat Пароль: N9P9426AGRM8
-📌 Аккаунты с Days Gone:
-• Логин: bajor538 Пароль: boduyashops5
-📌 Аккаунты с Wallpaper Engine:
-• Логин: DjRolle2008 Пароль: Deangelo
-📌 Аккаунты с Subnautica:
-• Логин: leche_de_s0ya Пароль: =H-r9cCXoh4Q
-📌 Аккаунты с Ghost of Tsushima:
-• Логин: maddox2009dude Пароль: retii228+-
-📌 Аккаунты с GhostRunner:
-• Логин: fpfuryfamily Пароль: thxfp362
-📌 Аккаунты с FNAF Security Breach:
-• Логин: nojevik__0 Пароль: wwe123456
-📌 Аккаунты с Mafia: Definitive Edition, Mafia II (Classic), Mafia II: Definitive Edition:
-• заменяется
-📌 Аккаунты с GTA V:
- • GTA STEAM - Логин: llore_gta_acc Пароль:    playerok.com/profile/LuckyLLore/products
-GTA SOCIAL CLUB - Логин: blacklllore2@gmail.com Пароль: f78sd67fsy6dfdsf45Ffgd#
-📌 Аккаунты с Warhammer 40,000: Space Marine 2:
-• Логин: spacemorine2 Пароль: jN8zPSm5Yy8BWCF
-📌 Аккаунты с Will To Live, Rust:
-• Логин: ouvw460 Пароль: xCr@@32450#v
-📌 Аккаунты с God of War Ragnarok:
-• заменяется
-📌 Аккаунты God of War (2018):
-• Логин: godofwarsteam123 Пароль: AYA558r!rroiH83
-📌 Аккаунты с Cyberpunk 2077:
-• Логин: dimaslol42 Пароль: retii228+
-📌 Аккаунты с Terraria:
-• Логин: jakecaslmon Пароль: tanusha99
-📌 Аккаунты с Horizon Zero Dawn:
-• Логин: chuky1100 Пароль: 66AEBMYY96SM
-📌 Аккаунты с Only Up!:
-• Логин: neogamerz5 пароль: dDZTdL-f
-📌 Аккаунты с Geometry Dash:
-• Логин: emablanco710 Пароль: Ema50121097
-📌 Аккаунты с My Summer Car:
-• Логин: pvztl641 Пароль: guLILI198611
-WorldBox - God Simulator Логин:Dimanaruto786
-Пароль: Dimalol786fanpei
-📌 Аккаунт с Разными играми
-Логин: marshall_stivenson
-Пароль: https://playerok.com/profile/QAVIX/products
-📌 Аккаунт с Euro Truck Simulator 2, Assetto Corsa
-логин: ets2xiajsh
-пароль: https://playerok.com/profile/QAVIX/products
-📌 Аккаунт с Gta 5, Red Dead Redemption 2
-Логин: gtaredqqq
-Пароль: playerok.com/profile/QAVIX
-📌 Аккаунт с Garrys Mod
-Login: hyper_pug3
-Password: BulbulofficialFP
-📌 Аккаунт с Sons Of The Forest, The Forest
-Логин: sonss22
-Пароль: playerok.com/profile/QAVIX
-📌 Аккаунт с Teardown, Geometry Dash, Phasmophobia, Terraria, Wallpaper Engine, Metro все части
-Логин: qavix2231
-Пароль: playerok.com/profile/QAVIX
-📌 Аккаунт с God of War Рагнарёк, God of War, Dying Light 2: Reloaded Edition, Ghost of Tsushima
-Логин: qavix221
-Пароль: playerok.com/profile/QAVIX
-📌 Аккаунт с Mortal Kombat 11, Mortal Kombat X, Forza Horizon 5
-Логин: qqq2549
-Пароль: playerok.com/profile/QAVIX
-📌 Аккаунт с Schedule I, Frostpunk, Assetto Corsa, People Playground
-Логин: qavix22
-Пароль: playerok.com/profile/QAVIX
-Report content on this page
-
-Еще приятный бонус по настройкам  
-
-
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_DELETE = None
