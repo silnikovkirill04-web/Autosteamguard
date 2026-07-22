@@ -1,6 +1,6 @@
 """
 SteamGuard Code v5.3 — Выдача Steam Guard по команде SGC (ULTRA)
-Настроен под письма Steam Guard
+С потокобезопасной очередью и защитой от блокировок Gmail
 """
 import uuid as uuid_lib
 import json
@@ -10,6 +10,7 @@ import email
 import re
 import time
 import threading
+import queue
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -39,6 +40,7 @@ SETTINGS = {
     "mail_count": 0,
     "mail_last_check": "",
     "issued_codes": {},
+    "admin_chat_id": None,  # 🔥 ВСТАВЬ СВОЙ ID ДЛЯ УВЕДОМЛЕНИЙ
 }
 
 # 🔥 ФИЛЬТРЫ (НАСТРОЕНЫ ПОД ПИСЬМА STEAM GUARD)
@@ -72,6 +74,10 @@ GUARD_KEYWORDS = [
     "login attempt",
     "request made from"
 ]
+
+# 🔥 ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ
+sg_queue = queue.Queue()
+queue_worker_running = False
 
 # ============================================
 # 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
@@ -141,7 +147,7 @@ def check_mail():
         return False, 0
 
 # ============================================
-# 🔥 ПОИСК КОДА (НАСТРОЕН ПОД ПИСЬМО)
+# 🔥 ПОИСК КОДА
 # ============================================
 
 def fetch_code():
@@ -153,6 +159,7 @@ def fetch_code():
     try:
         _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
         
+        # 🔥 ИСПРАВЛЕНО: правильная проверка на пустой байт
         if not mail_ids or not mail_ids[0] or mail_ids[0] == b'':
             conn.close()
             conn.logout()
@@ -186,14 +193,13 @@ def fetch_code():
                     conn.expunge()
                     continue
                 
-                # 🔥 Ищем 5-значный код
+                # Ищем 5-значный код
                 code_match = re.search(r'\b([A-Z0-9]{5})\b', body)
                 
                 if code_match:
                     code = code_match.group(1).upper()
                     print(f"[SG] 🔐 Найден код: {code}")
                     
-                    # 🔥 Проверяем ключевые слова
                     if any(kw in body_lower for kw in GUARD_KEYWORDS):
                         print(f"[SG] ✅ Ключевые слова найдены")
                         print(f"[SG] 🎉 КОД НАЙДЕН: {code}")
@@ -229,11 +235,39 @@ def fetch_code():
         return None
 
 # ============================================
-# 🔄 ОБРАБОТКА SGC (С ЦИКЛОМ ОЖИДАНИЯ)
+# 🔄 ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ
 # ============================================
 
-def process_sgc(chat_id, msg_id):
-    """Обработка запроса SGC с автоматическим ожиданием письма"""
+def queue_worker():
+    """Обработчик очереди запросов (ОДИН ПОТОК)"""
+    global queue_worker_running
+    print("[SG] 🏭 Очередь запущена (1 поток → нет блокировок Gmail)")
+    
+    while SETTINGS["active"]:
+        try:
+            task = sg_queue.get(timeout=1)
+            if task is None:
+                continue
+            
+            chat_id, msg_id = task
+            print(f"[SG] 📋 Обработка запроса из очереди: {chat_id}")
+            
+            # Обрабатываем запрос
+            process_sgc_task(chat_id)
+            sg_queue.task_done()
+            
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"[SG] ❌ Ошибка очереди: {e}")
+            try:
+                sg_queue.task_done()
+            except:
+                pass
+            time.sleep(1)
+
+def process_sgc_task(chat_id):
+    """Обработка запроса SGC с циклом ожидания (ВНУТРИ ОЧЕРЕДИ)"""
     print(f"[SG] 📥 Запуск ожидания кода для чата {chat_id}")
     cardinal.send_message(chat_id, "⏳ Проверяю почту, ожидайте код...")
     
@@ -252,7 +286,7 @@ def process_sgc(chat_id, msg_id):
             save_config()
             cardinal.send_message(chat_id, f"🎉 Код найден!\n\n🔐 Код: {code}")
             print(f"[SG] ✅ Код {code} успешно выдан {chat_id}")
-            return True
+            return
         
         # Уведомление каждые 30 секунд
         elapsed = int(time.time() - start_time)
@@ -269,7 +303,16 @@ def process_sgc(chat_id, msg_id):
     # Если за 3 минуты ничего не пришло
     cardinal.send_message(chat_id, "❌ Код не пришел от Steam. Пожалуйста, попробуйте войти заново и написать SGC.")
     print(f"[SG] ❌ Таймаут ожидания кода для {chat_id}")
-    return False
+
+# ============================================
+# 📝 ОБРАБОТКА SGC
+# ============================================
+
+def process_sgc(chat_id, msg_id):
+    """Постановка запроса SGC в очередь"""
+    print(f"[SG] 📥 Новый запрос SGC от {chat_id} → в очередь")
+    cardinal.send_message(chat_id, f"⏳ Запрос принят! Позиция в очереди: {sg_queue.qsize() + 1}")
+    sg_queue.put((chat_id, msg_id))
 
 # ============================================
 # 🔄 СКАНЕР ЧАТОВ
@@ -323,7 +366,7 @@ def chat_scanner():
                     continue
                 
                 print(f"[SG] 🔔 SGC от {chat_id}")
-                threading.Thread(target=process_sgc, args=(chat_id, msg_id), daemon=True).start()
+                process_sgc(chat_id, msg_id)
                 processed[chat_id] = msg_id
                 
                 try:
@@ -363,6 +406,7 @@ def show_menu(message):
         f"{'🟢' if mail_ok else '🔴'} Почта: {'ОК' if mail_ok else 'Ошибка'}\n"
         f"📬 Писем: {mail_count}\n"
         f"🔢 Выдано кодов: {len(SETTINGS.get('issued_codes', {}))}\n"
+        f"📋 Очередь: {sg_queue.qsize()}\n"
         f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'Активен' if SETTINGS['active'] else 'Отключён'}\n"
         f"🗑️ Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}\n"
         f"🛡️ Защита: ПОЛНАЯ\n"
@@ -376,7 +420,7 @@ def show_menu(message):
 # ============================================
 
 def init_plugin(c):
-    global cardinal, tg, bot
+    global cardinal, tg, bot, queue_worker_running
     cardinal = c
     tg = c.telegram
     bot = c.telegram.bot
@@ -385,7 +429,7 @@ def init_plugin(c):
     print("[SG] 🔐 ЗАГРУЗКА SteamGuard Code v5.3")
     print("[SG] 🛡️ ПОЛНАЯ ЗАЩИТА АКТИВИРОВАНА")
     print("[SG] ⏳ РЕЖИМ ОЖИДАНИЯ: 3 МИНУТЫ")
-    print("[SG] 📧 ФИЛЬТРЫ НАСТРОЕНЫ ПОД STEAM GUARD")
+    print("[SG] 📋 ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ")
     print("=" * 60)
     
     load_config()
@@ -395,6 +439,13 @@ def init_plugin(c):
         print("[SG] ✅ Почта подключена")
     else:
         print("[SG] ❌ ПРОВЕРЬ ПАРОЛЬ ПРИЛОЖЕНИЯ!")
+    
+    # 🔥 Запуск одного воркера очереди (НЕСКОЛЬКО ПОТОКОВ = БЛОКИРОВКА GMAIL!)
+    if not queue_worker_running:
+        queue_thread = threading.Thread(target=queue_worker, daemon=True)
+        queue_thread.start()
+        queue_worker_running = True
+        print("[SG] 🏭 Очередь запущена (1 поток)")
     
     c.add_telegram_commands(UUID, [("sg", "🔐 SteamGuard", True)])
     tg.msg_handler(show_menu, commands=["sg"])
@@ -422,10 +473,10 @@ def init_plugin(c):
     
     print("=" * 60)
     print("[SG] ✅ ПЛАГИН ЗАГРУЖЕН!")
-    print("[SG] 📌 SGC — запрос кода (ожидание до 3 минут)")
+    print("[SG] 📌 SGC — запрос кода (очередь + ожидание 3 мин)")
     print("[SG] 📌 /sg — меню")
     print("[SG] 🛡️ Защита от смены почты, телефона, аутентификатора")
-    print("[SG] 🔍 Ищет код в письмах с 'Steam Guard'")
+    print("[SG] 📋 Все запросы проходят через 1 поток → БЕЗ БЛОКИРОВОК GMAIL")
     print("=" * 60)
 
 BIND_TO_PRE_INIT = [init_plugin]
