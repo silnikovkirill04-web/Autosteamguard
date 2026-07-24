@@ -1,5 +1,5 @@
 """
-Lot Manager v1.1 — Управление лотами FunPay
+Lot Manager v1.2 — Управление лотами FunPay
 Управление ценой, количеством, статусом и описанием лотов
 """
 import uuid as uuid_lib
@@ -10,9 +10,10 @@ import time
 import threading
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from tg_bot.utils import escape
 
 NAME = "Lot Manager"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESCRIPTION = "Управление лотами FunPay: цена, количество, статус, описание"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
@@ -83,6 +84,13 @@ def save_config():
     except Exception as e:
         print(f"[LM] ❌ Ошибка сохранения: {e}")
 
+def escape_markdown(text):
+    """Экранирует спецсимволы для Markdown"""
+    if not text:
+        return ""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
+
 def get_lots_from_profile():
     """Загружает лоты из профиля FunPay"""
     try:
@@ -100,9 +108,9 @@ def get_lots_from_profile():
                 "price": lot.price,
                 "count": lot.count,
                 "active": lot.active,
-                "description": lot.description,
-                "short_desc": getattr(lot, 'short_description', ''),
-                "category": getattr(lot, 'category', 'Без категории'),
+                "description": lot.description or "",
+                "short_desc": getattr(lot, 'short_description', '') or "",
+                "category": getattr(lot, 'category', 'Без категории') or "Без категории",
                 "updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             }
             result.append(lot_data)
@@ -127,6 +135,7 @@ def update_lot(lot_id, **kwargs):
     try:
         lot = cardinal.account.get_lot(lot_id)
         if not lot:
+            print(f"[LM] ❌ Лот {lot_id} не найден")
             return False
         
         for key, value in kwargs.items():
@@ -141,7 +150,8 @@ def update_lot(lot_id, **kwargs):
             elif key == "short_desc":
                 lot.short_description = value
         
-        lot.save()
+        # 🔥 Исправлено: используем save_lot через аккаунт
+        cardinal.account.save_lot(lot)
         
         # Обновляем кэш
         if lot_id in SETTINGS["lots_cache"]:
@@ -151,14 +161,16 @@ def update_lot(lot_id, **kwargs):
             SETTINGS["lots_cache"][lot_id]["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             save_config()
         
+        print(f"[LM] ✅ Лот {lot_id} обновлен")
         return True
+        
     except Exception as e:
-        print(f"[LM] ❌ Ошибка обновления лота: {e}")
+        print(f"[LM] ❌ Ошибка обновления лота {lot_id}: {e}")
         return False
 
 def format_lot_name(name, active=True, max_len=35):
     """Форматирует название лота с указанием статуса"""
-    display = name[:max_len] + "..." if len(name) > max_len else name
+    display = escape_markdown(name[:max_len] + "..." if len(name) > max_len else name)
     if active:
         return f"🟢 `{display}`"
     else:
@@ -167,10 +179,13 @@ def format_lot_name(name, active=True, max_len=35):
 def format_lot_preview(lot):
     """Форматирует краткий preview лота"""
     status = "🟢 Активен" if lot.get("active", True) else "🔴 Неактивен"
-    text = f"**{lot.get('name', 'Без названия')}**\n"
+    name = escape_markdown(lot.get('name', 'Без названия'))
+    category = escape_markdown(lot.get('category', 'Без категории'))
+    
+    text = f"**{name}**\n"
     text += f"   💰 {lot.get('price', 0)}₽ | 📦 {lot.get('count', 0)} шт.\n"
     text += f"   📌 {status}\n"
-    text += f"   📂 {lot.get('category', 'Без категории')}\n"
+    text += f"   📂 {category}\n"
     text += f"   🆔 `{lot.get('id', '')}`\n"
     text += f"   🕐 {lot.get('updated', '')}\n"
     return text
@@ -182,20 +197,20 @@ def format_lot_preview(lot):
 def show_lots_menu(message, page=0, filter_type="all"):
     """Показывает список лотов с пагинацией и фильтрацией"""
     
-    # 🔥 Загружаем лоты из профиля
+    # Загружаем лоты из профиля
     loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка лотов из профиля...")
     lots = get_lots_from_profile()
     
     if not lots:
         bot.edit_message_text("❌ Нет доступных лотов или ошибка подключения к FunPay", message.chat.id, loading_msg.id)
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"{CBT_LOT_LOAD}:0"))
+        kb.add(InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"{CBT_LOT_LOAD}:0:all"))
         cardinal.send_message(message.chat.id, "❌ Лотов не найдено", reply_markup=kb)
         return
     
     bot.delete_message(message.chat.id, loading_msg.id)
     
-    # 🔥 Фильтрация
+    # Фильтрация
     if filter_type == "active":
         filtered = [l for l in lots if l["active"]]
     elif filter_type == "inactive":
@@ -224,8 +239,8 @@ def show_lots_menu(message, page=0, filter_type="all"):
     
     # Формируем текст
     total = len(lots)
-    total_active = len(active_lots)
-    total_inactive = len(inactive_lots)
+    total_active = len([l for l in lots if l["active"]])
+    total_inactive = len([l for l in lots if not l["active"]])
     
     filter_names = {
         "all": "Все",
@@ -241,10 +256,15 @@ def show_lots_menu(message, page=0, filter_type="all"):
         text += "❌ Нет лотов в этой категории\n"
     else:
         for i, lot in enumerate(page_lots, start + 1):
-            text += f"**{i}. {format_lot_name(lot['name'], lot['active'])}**\n"
+            name = escape_markdown(lot['name'])
+            category = escape_markdown(lot.get('category', 'Без категории'))
+            status_icon = "🟢" if lot['active'] else "🔴"
+            status_text = "Активен" if lot['active'] else "Неактивен"
+            
+            text += f"**{i}. {status_icon} `{name}`**\n"
             text += f"   💰 {lot['price']}₽ | 📦 {lot['count']} шт.\n"
-            text += f"   📌 {'🟢 Активен' if lot['active'] else '🔴 Неактивен'}\n"
-            text += f"   📂 {lot.get('category', 'Без категории')}\n"
+            text += f"   📌 {status_icon} {status_text}\n"
+            text += f"   📂 {category}\n"
             text += f"   🆔 `{lot['id']}`\n\n"
     
     # Клавиатура
@@ -269,9 +289,10 @@ def show_lots_menu(message, page=0, filter_type="all"):
     # Кнопки действий для каждого лота
     for lot in page_lots:
         lot_id = lot["id"]
+        name_short = escape_markdown(lot['name'][:12])
         status_btn = "🔴 Выкл" if lot["active"] else "🟢 Вкл"
         kb.row(
-            InlineKeyboardButton(f"✏️ {lot['name'][:12]}", callback_data=f"{CBT_LOT_EDIT}:{lot_id}:{page}:{filter_type}"),
+            InlineKeyboardButton(f"✏️ {name_short}", callback_data=f"{CBT_LOT_EDIT}:{lot_id}:{page}:{filter_type}"),
             InlineKeyboardButton(status_btn, callback_data=f"{CBT_LOT_STATUS}:{lot_id}:{page}:{filter_type}")
         )
     
@@ -296,23 +317,28 @@ def show_lot_edit(message, lot_id, page, filter_type="all"):
         return
     
     status = "🟢 Активен" if lot["active"] else "🔴 Неактивен"
+    name = escape_markdown(lot['name'])
+    category = escape_markdown(lot.get('category', 'Без категории'))
     
     text = f"**✏️ Редактирование лота**\n\n"
-    text += f"📌 **Название:** {lot['name']}\n"
+    text += f"📌 **Название:** {name}\n"
     text += f"💰 **Цена:** {lot['price']}₽\n"
     text += f"📦 **Количество:** {lot['count']} шт.\n"
     text += f"📌 **Статус:** {status}\n"
-    text += f"📂 **Категория:** {lot.get('category', 'Без категории')}\n"
+    text += f"📂 **Категория:** {category}\n"
     text += f"🆔 **ID:** `{lot['id']}`\n"
     text += f"🕐 **Обновлен:** {lot.get('updated', '')}\n\n"
     
+    # Экранируем описания
     if lot.get('description'):
-        text += f"📝 **Описание:**\n{lot['description'][:200]}...\n\n"
+        desc_preview = escape_markdown(lot['description'][:200])
+        text += f"📝 **Описание:**\n{desc_preview}...\n\n"
     else:
         text += f"📝 **Описание:** ❌ Не указано\n\n"
     
     if lot.get('short_desc'):
-        text += f"📄 **Краткое описание:**\n{lot['short_desc'][:100]}..."
+        short_preview = escape_markdown(lot['short_desc'][:100])
+        text += f"📄 **Краткое описание:**\n{short_preview}..."
     else:
         text += f"📄 **Краткое описание:** ❌ Не указано"
     
@@ -364,7 +390,8 @@ def show_stats(message):
     
     text += f"📂 **Категории:**\n"
     for cat, count in categories.items():
-        text += f"   • {cat}: {count} лотов\n"
+        cat_escaped = escape_markdown(cat)
+        text += f"   • {cat_escaped}: {count} лотов\n"
     
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:0:all"))
@@ -391,7 +418,6 @@ def handle_lot_action(call, action, lot_id, page, filter_type="all"):
         show_lots_menu(call.message, int(page), filter_type)
     
     elif action == "delete":
-        # Деактивируем лот
         if update_lot(lot_id, active=False):
             bot.answer_callback_query(call.id, "✅ Лот деактивирован")
         else:
@@ -461,7 +487,7 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.1")
+    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.2")
     print("=" * 50)
     
     load_config()
@@ -586,9 +612,11 @@ def init_plugin(c):
         show_stats(call.message)
         bot.answer_callback_query(call.id)
     
-    # Фоновое обновление
+    # 🔥 Фоновое обновление (с задержкой перед стартом)
     if SETTINGS.get("auto_update", True):
         def auto_updater():
+            # 🔥 Ждем 10 секунд перед стартом (сессия FunPay должна инициализироваться)
+            time.sleep(10)
             while True:
                 try:
                     get_lots_from_profile()
@@ -598,7 +626,7 @@ def init_plugin(c):
                 time.sleep(SETTINGS.get("update_interval", 60))
         
         threading.Thread(target=auto_updater, daemon=True).start()
-        print(f"[LM] 🔄 Автообновление: {SETTINGS.get('update_interval', 60)}с")
+        print(f"[LM] 🔄 Автообновление: {SETTINGS.get('update_interval', 60)}с (задержка 10с)")
     
     print("[LM] ✅ Плагин загружен!")
     print("[LM] 📌 Команды: /lots — список лотов, /lot_stats — статистика, /lot_load — загрузить лоты")
