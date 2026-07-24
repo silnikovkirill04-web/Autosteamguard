@@ -1,6 +1,6 @@
 """
-Lot Manager v1.7 — Управление лотами FunPay
-Автономное чтение лотов из системного кэша Cardinal
+Lot Manager v2.1 — Глобальный парсинг всех категорий FunPay
+Обновление лотов по ID категории
 """
 import uuid as uuid_lib
 import json
@@ -13,14 +13,13 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from tg_bot.utils import escape
 
 NAME = "Lot Manager"
-VERSION = "1.7.0"
-DESCRIPTION = "Управление лотами FunPay: цена, количество, статус, описание, удаление"
+VERSION = "2.1.0"
+DESCRIPTION = "Глобальный парсинг всех категорий FunPay"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
 
 CONFIG_PATH = "storage/cache/lot_manager.json"
-LOTS_CACHE_PATH = "storage/cache/lots.json"
 
 cardinal = None
 tg = None
@@ -29,8 +28,10 @@ bot = None
 # 🔥 НАСТРОЙКИ
 DEFAULT_SETTINGS = {
     "auto_update": True,
-    "update_interval": 60,
+    "update_interval": 120,
     "lots_cache": {},
+    "user_id": None,
+    "categories_cache": [],
 }
 
 SETTINGS = DEFAULT_SETTINGS.copy()
@@ -52,12 +53,15 @@ CBT_LOT_PAGE = "LotManager_Page"
 CBT_LOT_LOAD = "LotManager_Load"
 CBT_LOT_FILTER = "LotManager_Filter"
 CBT_LOT_UPDATE = "LotManager_Update"
+CBT_LOT_SCAN = "LotManager_Scan"
+CBT_LOT_SCAN_CATEGORY = "LotManager_ScanCategory"
 
 # Состояния ожидания ввода
 WAITING_PRICE = "waiting_price"
 WAITING_COUNT = "waiting_count"
 WAITING_DESC = "waiting_desc"
 WAITING_SHORT = "waiting_short"
+WAITING_CATEGORY_ID = "waiting_category_id"
 
 # ============================================
 # 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
@@ -87,71 +91,108 @@ def save_config():
         print(f"[LM] ❌ Ошибка сохранения: {e}")
 
 def escape_markdown(text):
-    """Экранирует спецсимволы для Markdown"""
     if not text:
         return ""
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
 
-def get_lots_from_profile():
-    """Автономное чтение лотов из системного кэша Cardinal (lots.json)"""
+def get_user_id():
+    """Получает user_id из профиля"""
     try:
-        print("[LM] 🔄 Чтение лотов из системного кэша Cardinal...")
+        session = cardinal.account.api.session
+        response = session.get("https://funpay.com", timeout=10)
         
-        # 🔥 Проверяем наличие файла кэша
-        if not os.path.exists(LOTS_CACHE_PATH):
-            print(f"[LM] ❌ Файл кэша не найден: {LOTS_CACHE_PATH}")
-            print("[LM] 💡 Подожди, пока Cardinal загрузит лоты, или обнови golden_key")
+        if response.status_code != 200:
+            return None
+        
+        match = re.search(r'data-user-id="(\d+)"', response.text)
+        if match:
+            return match.group(1)
+        
+        match = re.search(r'/profile/(\d+)/', response.text)
+        if match:
+            return match.group(1)
+        
+        return None
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка получения user_id: {e}")
+        return None
+
+def get_all_categories():
+    """Парсит все категории с главной страницы"""
+    try:
+        session = cardinal.account.api.session
+        response = session.get("https://funpay.com", timeout=10)
+        
+        if response.status_code != 200:
             return []
         
-        # 🔥 Читаем файл кэша
-        with open(LOTS_CACHE_PATH, "r", encoding="utf-8") as f:
-            cardinal_lots = json.load(f)
+        categories = set()
         
-        if not cardinal_lots:
-            print("[LM] ❌ Кэш пуст")
+        href_matches = re.findall(r'href="[^"]*/(?:category|category/)(\d+)[^"]*"', response.text)
+        for cat in href_matches:
+            categories.add(cat)
+        
+        data_matches = re.findall(r'data-category-id="(\d+)"', response.text)
+        for cat in data_matches:
+            categories.add(cat)
+        
+        return list(categories)
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка получения категорий: {e}")
+        return []
+
+def parse_lots_from_category(user_id, category_id):
+    """Парсит лоты из конкретной категории"""
+    try:
+        session = cardinal.account.api.session
+        url = f"https://funpay.com/category/{category_id}/"
+        response = session.get(url, timeout=10)
+        
+        if response.status_code != 200:
             return []
-        
-        print(f"[LM] 🔍 Найдено {len(cardinal_lots)} записей в кэше")
         
         result = []
-        for item in cardinal_lots:
+        
+        lot_pattern = r'data-lot=\'([^\']+)\''
+        lot_matches = re.findall(lot_pattern, response.text)
+        
+        for lot_json in lot_matches:
             try:
-                # 🔥 Извлекаем данные по структуре из скриншота
-                node_id = item.get("node_id", "")
-                fields = item.get("fields", {})
+                lot_data = json.loads(lot_json)
+                
+                lot_user_id = lot_data.get("user_id", "")
+                if lot_user_id and str(lot_user_id) != str(user_id):
+                    continue
+                
+                fields = lot_data.get("fields", {})
                 summary = fields.get("summary", {})
                 
-                # Название (русское или английское)
+                node_id = lot_data.get("node_id", "")
+                if not node_id:
+                    continue
+                
                 name = summary.get("ru", summary.get("en", "Без названия"))
                 
-                # Цена
-                price = item.get("price", "0")
+                price = lot_data.get("price", "0")
                 try:
                     price = int(price)
                 except:
                     price = 0
                 
-                # Количество
-                amount = item.get("amount", "0")
+                amount = lot_data.get("amount", "0")
                 try:
                     count = int(amount)
                 except:
                     count = 0
                 
-                # Статус (активен/неактивен)
-                active = item.get("active") in ["on", True]
+                active = lot_data.get("active") in ["on", True]
                 
-                # Описание (desc)
                 desc = fields.get("desc", {})
                 description = desc.get("ru", desc.get("en", ""))
                 
-                # Сообщение после оплаты (payment_msg)
                 payment_msg = fields.get("payment_msg", {})
                 short_desc = payment_msg.get("ru", payment_msg.get("en", ""))
-                
-                # Категория
-                category = f"Категория ID: {node_id}" if node_id else "Без категории"
                 
                 lot_entry = {
                     "id": node_id,
@@ -161,46 +202,106 @@ def get_lots_from_profile():
                     "active": active,
                     "description": description,
                     "short_desc": short_desc,
-                    "category": category,
+                    "category": f"Категория ID: {category_id}",
+                    "category_id": category_id,
                     "updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
                 }
                 
                 result.append(lot_entry)
                 
-                # Сохраняем в кэш плагина
-                if node_id:
-                    SETTINGS["lots_cache"][node_id] = lot_entry
-                
-                print(f"[LM] ✅ Загружен лот: {name[:30]}... (ID: {node_id}, цена: {price}₽, кол-во: {count})")
-                
-            except Exception as e:
-                print(f"[LM] ⚠️ Ошибка обработки лота: {e}")
+            except json.JSONDecodeError:
+                continue
+            except Exception:
                 continue
         
-        if result:
-            save_config()
-            print(f"[LM] ✅ Успешно загружено {len(result)} лотов из системного кэша")
-        else:
-            print("[LM] ❌ Не удалось загрузить ни одного лота")
-            print("[LM] 💡 Проверь файл: storage/cache/lots.json")
-        
         return result
-        
-    except json.JSONDecodeError as e:
-        print(f"[LM] ❌ Ошибка парсинга JSON: {e}")
-        return []
     except Exception as e:
-        print(f"[LM] ❌ Сбой загрузки: {e}")
+        print(f"[LM] ⚠️ Ошибка категории {category_id}: {e}")
+        return []
+
+def get_lots_from_profile():
+    """Глобальный парсинг всех категорий FunPay"""
+    try:
+        print("[LM] 🔄 ГЛОБАЛЬНЫЙ ПАРСИНГ ВСЕХ КАТЕГОРИЙ...")
+        
+        user_id = SETTINGS.get("user_id")
+        if not user_id:
+            user_id = get_user_id()
+            if user_id:
+                SETTINGS["user_id"] = user_id
+                save_config()
+                print(f"[LM] 🆔 Найден user_id: {user_id}")
+            else:
+                print("[LM] ❌ Не удалось найти user_id")
+                return []
+        
+        categories = get_all_categories()
+        if not categories:
+            print("[LM] ❌ Не найдены категории")
+            return []
+        
+        print(f"[LM] 📂 Найдено {len(categories)} категорий")
+        
+        all_lots = []
+        for i, cat_id in enumerate(categories, 1):
+            print(f"[LM] 🔍 Сканирование категории {i}/{len(categories)} (ID: {cat_id})...")
+            lots = parse_lots_from_category(user_id, cat_id)
+            if lots:
+                print(f"[LM] ✅ Найдено {len(lots)} лотов в категории {cat_id}")
+                all_lots.extend(lots)
+            time.sleep(1)
+        
+        if all_lots:
+            for lot in all_lots:
+                SETTINGS["lots_cache"][lot["id"]] = lot
+            save_config()
+            print(f"[LM] ✅ ВСЕГО НАЙДЕНО: {len(all_lots)} лотов")
+        else:
+            print("[LM] ❌ Лотов не найдено ни в одной категории")
+        
+        return all_lots
+        
+    except Exception as e:
+        print(f"[LM] ❌ Сбой глобального парсинга: {e}")
         import traceback
         traceback.print_exc()
         return []
 
+def get_lots_by_category(category_id):
+    """Парсит лоты только в указанной категории"""
+    try:
+        print(f"[LM] 🔍 Сканирование категории {category_id}...")
+        
+        user_id = SETTINGS.get("user_id")
+        if not user_id:
+            user_id = get_user_id()
+            if user_id:
+                SETTINGS["user_id"] = user_id
+                save_config()
+            else:
+                print("[LM] ❌ Не удалось найти user_id")
+                return []
+        
+        lots = parse_lots_from_category(user_id, category_id)
+        
+        if lots:
+            for lot in lots:
+                SETTINGS["lots_cache"][lot["id"]] = lot
+            save_config()
+            print(f"[LM] ✅ Найдено {len(lots)} лотов в категории {category_id}")
+        else:
+            print(f"[LM] ❌ Лотов не найдено в категории {category_id}")
+        
+        return lots
+        
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка сканирования категории {category_id}: {e}")
+        return []
+
 def get_cached_lots():
-    """Возвращает лоты из кэша плагина"""
     return list(SETTINGS.get("lots_cache", {}).values())
 
 def update_lot(lot_id, **kwargs):
-    """Обновляет параметры лота через API Cardinal"""
     try:
         lot = cardinal.account.get_lot(lot_id)
         if not lot:
@@ -221,7 +322,6 @@ def update_lot(lot_id, **kwargs):
         
         cardinal.account.save_lot(lot)
         
-        # Обновляем кэш плагина
         if lot_id in SETTINGS["lots_cache"]:
             for key, value in kwargs.items():
                 if key in SETTINGS["lots_cache"][lot_id]:
@@ -237,7 +337,6 @@ def update_lot(lot_id, **kwargs):
         return False
 
 def delete_lot(lot_id):
-    """Удаляет лот через API Cardinal"""
     try:
         lot = cardinal.account.get_lot(lot_id)
         if not lot:
@@ -262,25 +361,26 @@ def delete_lot(lot_id):
 # ============================================
 
 def show_lots_menu(message, page=0, filter_type="all"):
-    """Показывает список лотов с пагинацией и фильтрацией"""
-    
-    loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка лотов из кэша Cardinal...")
-    lots = get_lots_from_profile()
+    loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка лотов...")
+    lots = get_cached_lots()
     
     if not lots:
-        bot.edit_message_text("❌ Нет доступных лотов", message.chat.id, loading_msg.id)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"{CBT_LOT_LOAD}:0:all"))
+        bot.edit_message_text("🔄 Кэш пуст, сканирую категории...", message.chat.id, loading_msg.id)
+        lots = get_lots_from_profile()
+    
+    if not lots:
+        bot.edit_message_text("❌ Лотов не найдено", message.chat.id, loading_msg.id)
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.row(
+            InlineKeyboardButton("🔍 Сканировать все", callback_data=f"{CBT_LOT_SCAN}:0:all"),
+            InlineKeyboardButton("📂 По ID игры", callback_data=f"{CBT_LOT_SCAN_CATEGORY}:0:all")
+        )
         kb.add(InlineKeyboardButton("📝 Создать лот на FunPay", url="https://funpay.com/sell/"))
         bot.send_message(
-            message.chat.id, 
+            message.chat.id,
             "❌ Лотов не найдено.\n\n"
-            "💡 Проверь:\n"
-            "1. Файл storage/cache/lots.json существует\n"
-            "2. В нем есть данные о лотах\n"
-            "3. Ты залогинен в Cardinal\n"
-            "4. Подожди 15-20 секунд после запуска\n\n"
-            "📝 Создать лот можно по ссылке ниже",
+            "🔍 Сканировать все категории\n"
+            "📂 Или ввести ID конкретной игры",
             reply_markup=kb
         )
         return
@@ -368,7 +468,8 @@ def show_lots_menu(message, page=0, filter_type="all"):
     
     kb.row(
         InlineKeyboardButton("🔄 Обновить", callback_data=f"{CBT_LOT_REFRESH}:{page}:{filter_type}"),
-        InlineKeyboardButton("📥 Загрузить", callback_data=f"{CBT_LOT_LOAD}:{page}:{filter_type}")
+        InlineKeyboardButton("🔍 Все категории", callback_data=f"{CBT_LOT_SCAN}:{page}:{filter_type}"),
+        InlineKeyboardButton("📂 По ID игры", callback_data=f"{CBT_LOT_SCAN_CATEGORY}:{page}:{filter_type}")
     )
     kb.row(
         InlineKeyboardButton("📊 Статистика", callback_data="LotManager_Stats"),
@@ -378,7 +479,6 @@ def show_lots_menu(message, page=0, filter_type="all"):
     bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
 
 def show_lot_edit(message, lot_id, page, filter_type="all"):
-    """Показывает меню редактирования лота"""
     lots = get_cached_lots() or get_lots_from_profile()
     lot = next((l for l in lots if l.get("id") == lot_id), None)
     if not lot:
@@ -428,7 +528,6 @@ def show_lot_edit(message, lot_id, page, filter_type="all"):
     bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
 
 def show_delete_confirmation(call, lot_id, page, filter_type):
-    """Показывает окно подтверждения удаления (ПЕРВЫЙ ШАГ)"""
     lots = get_cached_lots() or get_lots_from_profile()
     lot = next((l for l in lots if l.get("id") == lot_id), None)
     if not lot:
@@ -441,7 +540,6 @@ def show_delete_confirmation(call, lot_id, page, filter_type):
     text += f"📌 **Название:** {name}\n"
     text += f"🆔 **ID:** `{lot_id}`\n\n"
     text += f"❗️ Это действие **НЕЛЬЗЯ ОТМЕНИТЬ**!\n"
-    text += f"Лот будет полностью удален с FunPay."
     
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
@@ -453,51 +551,31 @@ def show_delete_confirmation(call, lot_id, page, filter_type):
     bot.answer_callback_query(call.id)
 
 def handle_delete_confirm(call, lot_id, page, filter_type):
-    """Обрабатывает подтверждение удаления (ВТОРОЙ ШАГ)"""
     try:
         if delete_lot(lot_id):
             if lot_id in SETTINGS["lots_cache"]:
                 del SETTINGS["lots_cache"][lot_id]
                 save_config()
             
-            bot.edit_message_text(
-                f"✅ **Лот {lot_id} успешно удален!**",
-                call.message.chat.id,
-                call.message.id
-            )
+            bot.edit_message_text(f"✅ **Лот {lot_id} успешно удален!**", call.message.chat.id, call.message.id)
             bot.answer_callback_query(call.id, "🗑️ Лот удален!")
             show_lots_menu(call.message, int(page), filter_type)
         else:
-            bot.edit_message_text(
-                f"❌ **Ошибка при удалении лота {lot_id}**",
-                call.message.chat.id,
-                call.message.id
-            )
+            bot.edit_message_text(f"❌ **Ошибка при удалении лота {lot_id}**", call.message.chat.id, call.message.id)
             bot.answer_callback_query(call.id, "❌ Ошибка удаления")
-            
     except Exception as e:
-        bot.edit_message_text(
-            f"❌ **Ошибка:** {e}",
-            call.message.chat.id,
-            call.message.id
-        )
+        bot.edit_message_text(f"❌ **Ошибка:** {e}", call.message.chat.id, call.message.id)
         bot.answer_callback_query(call.id, "❌ Ошибка")
 
 def handle_delete_cancel(call, lot_id, page, filter_type):
-    """Отменяет удаление лота"""
-    bot.edit_message_text(
-        "✅ **Удаление отменено**",
-        call.message.chat.id,
-        call.message.id
-    )
+    bot.edit_message_text("✅ **Удаление отменено**", call.message.chat.id, call.message.id)
     bot.answer_callback_query(call.id, "❌ Отменено")
     show_lots_menu(call.message, int(page), filter_type)
 
 def show_stats(message):
-    """Показывает статистику по лотам"""
     lots = get_cached_lots() or get_lots_from_profile()
     if not lots:
-        bot.send_message(message.chat.id, "❌ Нет данных. Нажмите 'Загрузить лоты'")
+        bot.send_message(message.chat.id, "❌ Нет данных. Нажмите 'Сканировать'")
         return
     
     total = len(lots)
@@ -531,13 +609,7 @@ def show_stats(message):
     
     bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
 
-# ============================================
-# 🔄 ОБРАБОТЧИКИ
-# ============================================
-
 def handle_lot_action(call, action, lot_id, page, filter_type="all"):
-    """Обрабатывает действия с лотом"""
-    
     if action == "status":
         lots = get_cached_lots() or get_lots_from_profile()
         lot = next((l for l in lots if l.get("id") == lot_id), None)
@@ -551,20 +623,32 @@ def handle_lot_action(call, action, lot_id, page, filter_type="all"):
         show_lots_menu(call.message, int(page), filter_type)
 
 def handle_input(message):
-    """Обрабатывает ввод данных от пользователя"""
     state = tg.get_state(message.chat.id, message.from_user.id)
     if not state:
         return
     
     action = state["action"]
     data = state["data"]
-    lot_id = data.get("lot_id")
     page = data.get("page", 0)
     filter_type = data.get("filter_type", "all")
     
     try:
-        if action == WAITING_PRICE:
+        if action == WAITING_CATEGORY_ID:
+            category_id = message.text.strip()
+            if category_id.isdigit():
+                bot.reply_to(message, f"🔍 Сканирую категорию {category_id}...")
+                lots = get_lots_by_category(category_id)
+                if lots:
+                    bot.reply_to(message, f"✅ Найдено {len(lots)} лотов в категории {category_id}")
+                else:
+                    bot.reply_to(message, f"❌ Лотов не найдено в категории {category_id}")
+                show_lots_menu(message, int(page), filter_type)
+            else:
+                bot.reply_to(message, "❌ Введите число (ID категории)!")
+        
+        elif action == WAITING_PRICE:
             price = int(message.text.strip())
+            lot_id = data.get("lot_id")
             if update_lot(lot_id, price=price):
                 bot.reply_to(message, f"✅ Цена обновлена: {price}₽")
             else:
@@ -573,6 +657,7 @@ def handle_input(message):
         
         elif action == WAITING_COUNT:
             count = int(message.text.strip())
+            lot_id = data.get("lot_id")
             if update_lot(lot_id, count=count):
                 bot.reply_to(message, f"✅ Количество обновлено: {count}")
             else:
@@ -581,6 +666,7 @@ def handle_input(message):
         
         elif action == WAITING_DESC:
             desc = message.text.strip()
+            lot_id = data.get("lot_id")
             if update_lot(lot_id, description=desc):
                 bot.reply_to(message, "✅ Описание обновлено")
             else:
@@ -589,6 +675,7 @@ def handle_input(message):
         
         elif action == WAITING_SHORT:
             short = message.text.strip()
+            lot_id = data.get("lot_id")
             if update_lot(lot_id, short_desc=short):
                 bot.reply_to(message, "✅ Краткое описание обновлено")
             else:
@@ -613,35 +700,24 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.7")
-    print("[LM] 🔥 Автономное чтение из системного кэша Cardinal")
-    print("[LM] 🗑️ Двойное подтверждение удаления")
+    print("[LM] 📦 ЗАГРУЗКА Lot Manager v2.1")
+    print("[LM] 🔍 ГЛОБАЛЬНЫЙ ПАРСИНГ ВСЕХ КАТЕГОРИЙ")
+    print("[LM] 📂 ОБНОВЛЕНИЕ ПО ID КАТЕГОРИИ")
     print("=" * 50)
     
     load_config()
     
-    # Проверяем наличие файла кэша
-    if os.path.exists(LOTS_CACHE_PATH):
-        print(f"[LM] ✅ Файл кэша найден: {LOTS_CACHE_PATH}")
-        try:
-            with open(LOTS_CACHE_PATH, "r", encoding="utf-8") as f:
-                test_data = json.load(f)
-                print(f"[LM] 📊 В кэше {len(test_data)} записей")
-        except Exception as e:
-            print(f"[LM] ⚠️ Ошибка чтения кэша: {e}")
-    else:
-        print(f"[LM] ⚠️ Файл кэша НЕ НАЙДЕН: {LOTS_CACHE_PATH}")
-        print("[LM] 💡 Подожди, пока Cardinal загрузит лоты, или обнови golden_key")
-    
     c.add_telegram_commands(UUID, [
         ("lots", "📦 Управление лотами", True),
         ("lot_stats", "📊 Статистика лотов", True),
-        ("lot_load", "📥 Загрузить лоты", True)
+        ("lot_load", "📥 Загрузить лоты", True),
+        ("lot_scan", "🔍 Сканировать категории", True)
     ])
     
     tg.msg_handler(lambda m: show_lots_menu(m), commands=["lots"])
     tg.msg_handler(lambda m: show_stats(m), commands=["lot_stats"])
     tg.msg_handler(lambda m: show_lots_menu(m), commands=["lot_load"])
+    tg.msg_handler(lambda m: show_lots_menu(m), commands=["lot_scan"])
     tg.msg_handler(handle_input, func=lambda m: tg.check_state(m.chat.id, m.from_user.id))
     
     @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_LIST))
@@ -755,6 +831,22 @@ def init_plugin(c):
         get_lots_from_profile()
         show_lots_menu(call.message, int(page), filter_type)
     
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_SCAN))
+    def handle_scan_all(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        bot.answer_callback_query(call.id, "🔍 Сканирование всех категорий...")
+        get_lots_from_profile()
+        show_lots_menu(call.message, int(page), filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_SCAN_CATEGORY))
+    def handle_scan_category(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        bot.answer_callback_query(call.id, "📂 Введите ID категории")
+        msg = bot.send_message(call.message.chat.id, "📂 Введите ID категории (цифры):\n\nПример: 12345")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_CATEGORY_ID, {"page": page, "filter_type": filter_type})
+    
     @bot.callback_query_handler(func=lambda call: call.data == "LotManager_Stats")
     def handle_stats(call):
         show_stats(call.message)
@@ -769,15 +861,14 @@ def init_plugin(c):
                     print(f"[LM] 🔄 Автообновление выполнено")
                 except Exception as e:
                     print(f"[LM] ❌ Ошибка автообновления: {e}")
-                time.sleep(SETTINGS.get("update_interval", 60))
+                time.sleep(SETTINGS.get("update_interval", 120))
         
         threading.Thread(target=auto_updater, daemon=True).start()
-        print(f"[LM] 🔄 Автообновление: {SETTINGS.get('update_interval', 60)}с (задержка 10с)")
+        print(f"[LM] 🔄 Автообновление: {SETTINGS.get('update_interval', 120)}с")
     
     print("[LM] ✅ Плагин загружен!")
-    print("[LM] 📌 Команды: /lots, /lot_stats, /lot_load")
-    print("[LM] 🗑️ Для удаления: кнопка 🗑️ → подтверждение → ДА, УДАЛИТЬ")
-    print(f"[LM] 📁 Чтение из: {LOTS_CACHE_PATH}")
+    print("[LM] 📌 Команды: /lots, /lot_stats, /lot_load, /lot_scan")
+    print("[LM] 📂 Обновление по ID категории: кнопка 'По ID игры'")
     print("=" * 50)
 
 # ============================================
