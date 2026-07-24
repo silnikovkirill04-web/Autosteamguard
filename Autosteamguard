@@ -1,83 +1,60 @@
 """
-SteamGuard Code v5.3 — Выдача Steam Guard по команде SGC (ULTRA)
-С потокобезопасной очередью и защитой от блокировок Gmail
+Lot Manager v1.1 — Управление лотами FunPay
+Управление ценой, количеством, статусом и описанием лотов
 """
 import uuid as uuid_lib
 import json
 import os
-import imaplib
-import email
 import re
 import time
 import threading
-import queue
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-NAME = "SteamGuard Code"
-VERSION = "5.3.0"
-DESCRIPTION = "Выдача Steam Guard по команде SGC (Ultra)"
+NAME = "Lot Manager"
+VERSION = "1.1.0"
+DESCRIPTION = "Управление лотами FunPay: цена, количество, статус, описание"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
-SETTINGS_PAGE = False
+SETTINGS_PAGE = True
 
-CONFIG_PATH = "storage/cache/steamguard_config.json"
+CONFIG_PATH = "storage/cache/lot_manager.json"
 
 cardinal = None
 tg = None
 bot = None
 
 # 🔥 НАСТРОЙКИ
-SETTINGS = {
-    "imap_host": "imap.gmail.com",
-    "imap_port": 993,
-    "imap_login": "silnikovkirill04@gmail.com",
-    "imap_password": "gotihysatnhmsowx",  # 🔥 ЗАМЕНИ НА НОВЫЙ ПАРОЛЬ
-    "steam_sender": "noreply@steampowered.com",
-    "active": True,
-    "delete_after_use": True,
-    "mail_status": False,
-    "mail_count": 0,
-    "mail_last_check": "",
-    "issued_codes": {},
-    "admin_chat_id": None,  # 🔥 ВСТАВЬ СВОЙ ID ДЛЯ УВЕДОМЛЕНИЙ
+DEFAULT_SETTINGS = {
+    "auto_update": True,
+    "update_interval": 60,
+    "lots_cache": {},  # {lot_id: {name, price, count, active, description, short_desc, updated}}
 }
 
-# 🔥 ФИЛЬТРЫ (НАСТРОЕНЫ ПОД ПИСЬМА STEAM GUARD)
-BLOCKED_SUBJECTS = [
-    "пароль", "password", "смена", "change", "reset", "сброс",
-    "восстановление", "recovery", "удаление", "delete", "remove",
-    "почта", "email", "телефон", "phone",
-    "привязка", "link", "отвязка", "unlink",
-    "аутентификатор", "authenticator",
-    "двухфакторная", "two-factor", "2fa"
-]
+SETTINGS = DEFAULT_SETTINGS.copy()
 
-BLOCKED_BODY = [
-    "сменить пароль", "change password", "reset password",
-    "удалить аккаунт", "delete account", "remove account",
-    "сменить почту", "change email", "update email",
-    "привязать телефон", "add phone", "удалить телефон", "remove phone",
-    "отключить аутентификатор", "authenticator removed",
-    "отключить двухфакторную", "two-factor disabled",
-]
+# 🔥 КНОПКИ
+CBT_LOT_LIST = "LotManager_List"
+CBT_LOT_EDIT = "LotManager_Edit"
+CBT_LOT_PRICE = "LotManager_Price"
+CBT_LOT_COUNT = "LotManager_Count"
+CBT_LOT_STATUS = "LotManager_Status"
+CBT_LOT_DESC = "LotManager_Desc"
+CBT_LOT_SHORT = "LotManager_Short"
+CBT_LOT_DELETE = "LotManager_Delete"
+CBT_LOT_REFRESH = "LotManager_Refresh"
+CBT_LOT_BACK = "LotManager_Back"
+CBT_LOT_PAGE = "LotManager_Page"
+CBT_LOT_LOAD = "LotManager_Load"
+CBT_LOT_FILTER = "LotManager_Filter"
+CBT_LOT_UPDATE = "LotManager_Update"
+CBT_LOT_CATEGORY = "LotManager_Category"
 
-# 🔥 КЛЮЧЕВЫЕ СЛОВА ДЛЯ ПОИСКА КОДА
-GUARD_KEYWORDS = [
-    "steam guard code",
-    "steam guard",
-    "access your account",
-    "log in from a new device",
-    "new device",
-    "verification code",
-    "steam guard code you need",
-    "login attempt",
-    "request made from"
-]
-
-# 🔥 ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ
-sg_queue = queue.Queue()
-queue_worker_running = False
+# Состояния ожидания ввода
+WAITING_PRICE = "waiting_price"
+WAITING_COUNT = "waiting_count"
+WAITING_DESC = "waiting_desc"
+WAITING_SHORT = "waiting_short"
 
 # ============================================
 # 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
@@ -92,392 +69,544 @@ def load_config():
                 for k in loaded:
                     if k in SETTINGS:
                         SETTINGS[k] = loaded[k]
-    except: pass
+        else:
+            save_config()
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка загрузки конфига: {e}")
+        save_config()
 
 def save_config():
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
-    except: pass
-
-def is_dangerous_email(body_lower, subject_lower):
-    """Проверяет письмо на опасные действия"""
-    for phrase in BLOCKED_BODY:
-        if phrase in body_lower:
-            return True
-    for word in BLOCKED_SUBJECTS:
-        if word in subject_lower:
-            return True
-    return False
-
-# ============================================
-# 📧 РАБОТА С ПОЧТОЙ
-# ============================================
-
-def get_imap():
-    try:
-        conn = imaplib.IMAP4_SSL(SETTINGS["imap_host"], SETTINGS["imap_port"], timeout=15)
-        conn.login(SETTINGS["imap_login"], SETTINGS["imap_password"])
-        conn.select("INBOX")
-        return conn
     except Exception as e:
-        print(f"[SG] ❌ Ошибка подключения: {e}")
-        return None
+        print(f"[LM] ❌ Ошибка сохранения: {e}")
 
-def check_mail():
+def get_lots_from_profile():
+    """Загружает лоты из профиля FunPay"""
     try:
-        conn = get_imap()
-        if not conn:
-            return False, 0
-        _, mails = conn.search(None, "ALL")
-        count = len(mails[0].split()) if mails[0] else 0
-        conn.close()
-        conn.logout()
-        SETTINGS["mail_status"] = True
-        SETTINGS["mail_count"] = count
-        SETTINGS["mail_last_check"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        save_config()
-        print(f"[SG] ✅ Почта: {count} писем")
-        return True, count
-    except Exception as e:
-        print(f"[SG] ❌ Ошибка проверки почты: {e}")
-        SETTINGS["mail_status"] = False
-        save_config()
-        return False, 0
-
-# ============================================
-# 🔥 ПОИСК КОДА
-# ============================================
-
-def fetch_code():
-    """Поиск кода в непрочитанных письмах от Steam"""
-    conn = get_imap()
-    if not conn:
-        return None
-    
-    try:
-        _, mail_ids = conn.search(None, f'UNSEEN FROM "{SETTINGS["steam_sender"]}"')
+        print("[LM] 🔄 Загрузка лотов из профиля...")
+        lots = cardinal.account.get_lots()
+        if not lots:
+            print("[LM] ❌ Лотов не найдено")
+            return []
         
-        # 🔥 ИСПРАВЛЕНО: правильная проверка на пустой байт
-        if not mail_ids or not mail_ids[0] or mail_ids[0] == b'':
-            conn.close()
-            conn.logout()
-            return None
-        
-        print(f"[SG] 📬 Найдено {len(mail_ids[0].split())} новых писем от Steam")
-        
-        for mail_id in reversed(mail_ids[0].split()[-5:]):
-            try:
-                _, raw = conn.fetch(mail_id, "(RFC822)")
-                mail_obj = email.message_from_bytes(raw[0][1])
-                
-                subject = mail_obj.get("Subject", "Без темы")
-                subject_lower = subject.lower()
-                
-                body = ""
-                if mail_obj.is_multipart():
-                    for part in mail_obj.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                            break
-                else:
-                    body = mail_obj.get_payload(decode=True).decode("utf-8", errors="ignore")
-                
-                body_lower = body.lower()
-                
-                # Проверка на опасность
-                if is_dangerous_email(body_lower, subject_lower):
-                    print(f"[SG] 🚫 Опасное письмо: {subject[:50]}")
-                    conn.store(mail_id, "+FLAGS", "\\Deleted")
-                    conn.expunge()
-                    continue
-                
-                # Ищем 5-значный код
-                code_match = re.search(r'\b([A-Z0-9]{5})\b', body)
-                
-                if code_match:
-                    code = code_match.group(1).upper()
-                    print(f"[SG] 🔐 Найден код: {code}")
-                    
-                    if any(kw in body_lower for kw in GUARD_KEYWORDS):
-                        print(f"[SG] ✅ Ключевые слова найдены")
-                        print(f"[SG] 🎉 КОД НАЙДЕН: {code}")
-                        
-                        if SETTINGS.get("delete_after_use", True):
-                            conn.store(mail_id, "+FLAGS", "\\Deleted")
-                            conn.expunge()
-                            print(f"[SG] 🗑️ Письмо с кодом {code} УДАЛЕНО")
-                        
-                        conn.close()
-                        conn.logout()
-                        return code
-                    else:
-                        print(f"[SG] ⚠️ Код есть, но нет ключевых слов")
-                else:
-                    print(f"[SG] ❌ Код не найден в письме")
-                    
-            except Exception as e:
-                print(f"[SG] ❌ Ошибка обработки письма: {e}")
-                continue
-        
-        conn.close()
-        conn.logout()
-        return None
-        
-    except Exception as e:
-        print(f"[SG] ❌ Критическая ошибка: {e}")
-        try:
-            conn.close()
-            conn.logout()
-        except:
-            pass
-        return None
-
-# ============================================
-# 🔄 ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ
-# ============================================
-
-def queue_worker():
-    """Обработчик очереди запросов (ОДИН ПОТОК)"""
-    global queue_worker_running
-    print("[SG] 🏭 Очередь запущена (1 поток → нет блокировок Gmail)")
-    
-    while SETTINGS["active"]:
-        try:
-            task = sg_queue.get(timeout=1)
-            if task is None:
-                continue
-            
-            chat_id, msg_id = task
-            print(f"[SG] 📋 Обработка запроса из очереди: {chat_id}")
-            
-            # Обрабатываем запрос
-            process_sgc_task(chat_id)
-            sg_queue.task_done()
-            
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[SG] ❌ Ошибка очереди: {e}")
-            try:
-                sg_queue.task_done()
-            except:
-                pass
-            time.sleep(1)
-
-def process_sgc_task(chat_id):
-    """Обработка запроса SGC с циклом ожидания (ВНУТРИ ОЧЕРЕДИ)"""
-    print(f"[SG] 📥 Запуск ожидания кода для чата {chat_id}")
-    cardinal.send_message(chat_id, "⏳ Проверяю почту, ожидайте код...")
-    
-    start_time = time.time()
-    timeout = 180  # Ждем максимум 3 минуты
-    check_interval = 6  # Проверка каждые 6 секунд
-    last_notify = 0
-    
-    while time.time() - start_time < timeout:
-        code = fetch_code()
-        if code:
-            SETTINGS["issued_codes"][code] = {
-                "time": datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
-                "chat_id": chat_id
+        result = []
+        for lot in lots:
+            lot_data = {
+                "id": lot.id,
+                "name": lot.name,
+                "price": lot.price,
+                "count": lot.count,
+                "active": lot.active,
+                "description": lot.description,
+                "short_desc": getattr(lot, 'short_description', ''),
+                "category": getattr(lot, 'category', 'Без категории'),
+                "updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             }
-            save_config()
-            cardinal.send_message(chat_id, f"🎉 Код найден!\n\n🔐 Код: {code}")
-            print(f"[SG] ✅ Код {code} успешно выдан {chat_id}")
-            return
+            result.append(lot_data)
+            
+            # Сохраняем в кэш
+            SETTINGS["lots_cache"][lot.id] = lot_data
         
-        # Уведомление каждые 30 секунд
-        elapsed = int(time.time() - start_time)
-        if elapsed - last_notify >= 30:
-            last_notify = elapsed
-            remaining = int((timeout - elapsed) / 60)
-            if remaining > 1:
-                cardinal.send_message(chat_id, f"⏳ Ждем код... {remaining} минут осталось")
-            elif remaining == 1:
-                cardinal.send_message(chat_id, f"⏳ Ждем код... 1 минута осталась")
-            
-        time.sleep(check_interval)
-    
-    # Если за 3 минуты ничего не пришло
-    cardinal.send_message(chat_id, "❌ Код не пришел от Steam. Пожалуйста, попробуйте войти заново и написать SGC.")
-    print(f"[SG] ❌ Таймаут ожидания кода для {chat_id}")
+        save_config()
+        print(f"[LM] ✅ Загружено {len(result)} лотов")
+        return result
+        
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка загрузки лотов: {e}")
+        return []
 
-# ============================================
-# 📝 ОБРАБОТКА SGC
-# ============================================
+def get_cached_lots():
+    """Возвращает лоты из кэша"""
+    return list(SETTINGS.get("lots_cache", {}).values())
 
-def process_sgc(chat_id, msg_id):
-    """Постановка запроса SGC в очередь"""
-    print(f"[SG] 📥 Новый запрос SGC от {chat_id} → в очередь")
-    cardinal.send_message(chat_id, f"⏳ Запрос принят! Позиция в очереди: {sg_queue.qsize() + 1}")
-    sg_queue.put((chat_id, msg_id))
+def update_lot(lot_id, **kwargs):
+    """Обновляет параметры лота"""
+    try:
+        lot = cardinal.account.get_lot(lot_id)
+        if not lot:
+            return False
+        
+        for key, value in kwargs.items():
+            if key == "price":
+                lot.price = value
+            elif key == "count":
+                lot.count = value
+            elif key == "active":
+                lot.active = value
+            elif key == "description":
+                lot.description = value
+            elif key == "short_desc":
+                lot.short_description = value
+        
+        lot.save()
+        
+        # Обновляем кэш
+        if lot_id in SETTINGS["lots_cache"]:
+            for key, value in kwargs.items():
+                if key in SETTINGS["lots_cache"][lot_id]:
+                    SETTINGS["lots_cache"][lot_id][key] = value
+            SETTINGS["lots_cache"][lot_id]["updated"] = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            save_config()
+        
+        return True
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка обновления лота: {e}")
+        return False
 
-# ============================================
-# 🔄 СКАНЕР ЧАТОВ
-# ============================================
+def format_lot_name(name, active=True, max_len=35):
+    """Форматирует название лота с указанием статуса"""
+    display = name[:max_len] + "..." if len(name) > max_len else name
+    if active:
+        return f"🟢 `{display}`"
+    else:
+        return f"🔴 `{display}`"
 
-def chat_scanner():
-    processed = {}
-    print("[SG] 🛰 Сканер чатов запущен")
-    print("[SG] 📡 Ожидание команд SGC...")
-    
-    while True:
-        if not SETTINGS["active"]:
-            time.sleep(1)
-            continue
-        try:
-            chats = cardinal.account.get_chats(update=True)
-            
-            if not chats:
-                time.sleep(1)
-                continue
-            
-            for chat_id, chat in chats.items():
-                if not chat.unread:
-                    continue
-                
-                try:
-                    msgs = cardinal.account.get_chat_history(chat_id)
-                except Exception as e:
-                    print(f"[SG] ❌ Ошибка истории {chat_id}: {e}")
-                    continue
-                
-                if not msgs:
-                    continue
-                
-                buyer_text = ""
-                msg_id = 0
-                for msg in reversed(msgs):
-                    if hasattr(msg, "author_id") and msg.author_id not in (cardinal.account.id, 0):
-                        if msg.text and msg.text.strip():
-                            buyer_text = msg.text.strip()
-                            msg_id = msg.id
-                            break
-                
-                if not buyer_text:
-                    continue
-                
-                if buyer_text.upper().strip() != "SGC":
-                    continue
-                
-                if chat_id in processed and processed[chat_id] >= msg_id:
-                    continue
-                
-                print(f"[SG] 🔔 SGC от {chat_id}")
-                process_sgc(chat_id, msg_id)
-                processed[chat_id] = msg_id
-                
-                try:
-                    if hasattr(cardinal.account, 'mark_as_read'):
-                        cardinal.account.mark_as_read(chat_id)
-                except Exception as e:
-                    print(f"[SG] ⚠️ Не удалось пометить как прочитанное: {e}")
-            
-            if len(processed) > 100:
-                processed = dict(list(processed.items())[-50:])
-            time.sleep(1)
-            
-        except Exception as e:
-            print(f"[SG] ❌ Ошибка сканера: {e}")
-            time.sleep(2)
+def format_lot_preview(lot):
+    """Форматирует краткий preview лота"""
+    status = "🟢 Активен" if lot.get("active", True) else "🔴 Неактивен"
+    text = f"**{lot.get('name', 'Без названия')}**\n"
+    text += f"   💰 {lot.get('price', 0)}₽ | 📦 {lot.get('count', 0)} шт.\n"
+    text += f"   📌 {status}\n"
+    text += f"   📂 {lot.get('category', 'Без категории')}\n"
+    text += f"   🆔 `{lot.get('id', '')}`\n"
+    text += f"   🕐 {lot.get('updated', '')}\n"
+    return text
 
 # ============================================
 # 📱 ИНТЕРФЕЙС
 # ============================================
 
-def show_menu(message):
-    mail_ok, mail_count = check_mail()
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton(
-        f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'ВКЛ' if SETTINGS['active'] else 'ВЫКЛ'}",
-        callback_data="sg_toggle"
-    ))
-    kb.add(InlineKeyboardButton(
-        f"{'🗑️' if SETTINGS.get('delete_after_use', True) else '📦'} Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}",
-        callback_data="sg_toggle_delete"
-    ))
-    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="sg_refresh"))
+def show_lots_menu(message, page=0, filter_type="all"):
+    """Показывает список лотов с пагинацией и фильтрацией"""
     
-    text = (
-        f"🔐 SteamGuard Code v{VERSION}\n\n"
-        f"📧 {SETTINGS['imap_login']}\n"
-        f"{'🟢' if mail_ok else '🔴'} Почта: {'ОК' if mail_ok else 'Ошибка'}\n"
-        f"📬 Писем: {mail_count}\n"
-        f"🔢 Выдано кодов: {len(SETTINGS.get('issued_codes', {}))}\n"
-        f"📋 Очередь: {sg_queue.qsize()}\n"
-        f"{'🟢' if SETTINGS['active'] else '🔴'} Плагин: {'Активен' if SETTINGS['active'] else 'Отключён'}\n"
-        f"🗑️ Удаление писем: {'ВКЛ' if SETTINGS.get('delete_after_use', True) else 'ВЫКЛ'}\n"
-        f"🛡️ Защита: ПОЛНАЯ\n"
-        f"⏳ Ожидание: до 3 минут\n\n"
-        f"💬 Команда: SGC"
+    # 🔥 Загружаем лоты из профиля
+    loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка лотов из профиля...")
+    lots = get_lots_from_profile()
+    
+    if not lots:
+        bot.edit_message_text("❌ Нет доступных лотов или ошибка подключения к FunPay", message.chat.id, loading_msg.id)
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"{CBT_LOT_LOAD}:0"))
+        cardinal.send_message(message.chat.id, "❌ Лотов не найдено", reply_markup=kb)
+        return
+    
+    bot.delete_message(message.chat.id, loading_msg.id)
+    
+    # 🔥 Фильтрация
+    if filter_type == "active":
+        filtered = [l for l in lots if l["active"]]
+    elif filter_type == "inactive":
+        filtered = [l for l in lots if not l["active"]]
+    else:
+        filtered = lots
+    
+    # Сортировка: активные сверху
+    active_lots = [l for l in filtered if l["active"]]
+    inactive_lots = [l for l in filtered if not l["active"]]
+    sorted_lots = active_lots + inactive_lots
+    
+    # Пагинация (по 5 лотов на страницу)
+    per_page = 5
+    total_pages = (len(sorted_lots) + per_page - 1) // per_page
+    if total_pages == 0:
+        total_pages = 1
+    if page >= total_pages:
+        page = total_pages - 1
+    if page < 0:
+        page = 0
+    
+    start = page * per_page
+    end = min(start + per_page, len(sorted_lots))
+    page_lots = sorted_lots[start:end]
+    
+    # Формируем текст
+    total = len(lots)
+    total_active = len(active_lots)
+    total_inactive = len(inactive_lots)
+    
+    filter_names = {
+        "all": "Все",
+        "active": "🟢 Активные",
+        "inactive": "🔴 Неактивные"
+    }
+    
+    text = f"📋 **Список лотов**\n"
+    text += f"📂 {filter_names.get(filter_type, 'Все')} | стр. {page + 1}/{total_pages}\n"
+    text += f"📊 Всего: {total} | 🟢 Активных: {total_active} | 🔴 Неактивных: {total_inactive}\n\n"
+    
+    if not page_lots:
+        text += "❌ Нет лотов в этой категории\n"
+    else:
+        for i, lot in enumerate(page_lots, start + 1):
+            text += f"**{i}. {format_lot_name(lot['name'], lot['active'])}**\n"
+            text += f"   💰 {lot['price']}₽ | 📦 {lot['count']} шт.\n"
+            text += f"   📌 {'🟢 Активен' if lot['active'] else '🔴 Неактивен'}\n"
+            text += f"   📂 {lot.get('category', 'Без категории')}\n"
+            text += f"   🆔 `{lot['id']}`\n\n"
+    
+    # Клавиатура
+    kb = InlineKeyboardMarkup(row_width=3)
+    
+    # Кнопки фильтрации
+    kb.row(
+        InlineKeyboardButton("📂 Все", callback_data=f"{CBT_LOT_FILTER}:all:{page}"),
+        InlineKeyboardButton("🟢 Активные", callback_data=f"{CBT_LOT_FILTER}:active:{page}"),
+        InlineKeyboardButton("🔴 Неактивные", callback_data=f"{CBT_LOT_FILTER}:inactive:{page}")
     )
-    cardinal.send_message(message.chat.id, text, reply_markup=kb)
+    
+    # Кнопки навигации
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("◀️", callback_data=f"{CBT_LOT_PAGE}:{page - 1}:{filter_type}"))
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton("▶️", callback_data=f"{CBT_LOT_PAGE}:{page + 1}:{filter_type}"))
+    if nav_buttons:
+        kb.row(*nav_buttons)
+    
+    # Кнопки действий для каждого лота
+    for lot in page_lots:
+        lot_id = lot["id"]
+        status_btn = "🔴 Выкл" if lot["active"] else "🟢 Вкл"
+        kb.row(
+            InlineKeyboardButton(f"✏️ {lot['name'][:12]}", callback_data=f"{CBT_LOT_EDIT}:{lot_id}:{page}:{filter_type}"),
+            InlineKeyboardButton(status_btn, callback_data=f"{CBT_LOT_STATUS}:{lot_id}:{page}:{filter_type}")
+        )
+    
+    # Общие кнопки
+    kb.row(
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"{CBT_LOT_REFRESH}:{page}:{filter_type}"),
+        InlineKeyboardButton("📥 Загрузить", callback_data=f"{CBT_LOT_LOAD}:{page}:{filter_type}")
+    )
+    kb.row(
+        InlineKeyboardButton("📊 Статистика", callback_data="LotManager_Stats"),
+        InlineKeyboardButton("🔄 Синхронизировать", callback_data=f"{CBT_LOT_UPDATE}:{page}:{filter_type}")
+    )
+    
+    cardinal.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+
+def show_lot_edit(message, lot_id, page, filter_type="all"):
+    """Показывает меню редактирования лота"""
+    lots = get_cached_lots() or get_lots_from_profile()
+    lot = next((l for l in lots if l["id"] == lot_id), None)
+    if not lot:
+        cardinal.send_message(message.chat.id, "❌ Лот не найден")
+        return
+    
+    status = "🟢 Активен" if lot["active"] else "🔴 Неактивен"
+    
+    text = f"**✏️ Редактирование лота**\n\n"
+    text += f"📌 **Название:** {lot['name']}\n"
+    text += f"💰 **Цена:** {lot['price']}₽\n"
+    text += f"📦 **Количество:** {lot['count']} шт.\n"
+    text += f"📌 **Статус:** {status}\n"
+    text += f"📂 **Категория:** {lot.get('category', 'Без категории')}\n"
+    text += f"🆔 **ID:** `{lot['id']}`\n"
+    text += f"🕐 **Обновлен:** {lot.get('updated', '')}\n\n"
+    
+    if lot.get('description'):
+        text += f"📝 **Описание:**\n{lot['description'][:200]}...\n\n"
+    else:
+        text += f"📝 **Описание:** ❌ Не указано\n\n"
+    
+    if lot.get('short_desc'):
+        text += f"📄 **Краткое описание:**\n{lot['short_desc'][:100]}..."
+    else:
+        text += f"📄 **Краткое описание:** ❌ Не указано"
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("💰 Цена", callback_data=f"{CBT_LOT_PRICE}:{lot_id}:{page}:{filter_type}"),
+        InlineKeyboardButton("📦 Кол-во", callback_data=f"{CBT_LOT_COUNT}:{lot_id}:{page}:{filter_type}")
+    )
+    kb.row(
+        InlineKeyboardButton("📝 Описание", callback_data=f"{CBT_LOT_DESC}:{lot_id}:{page}:{filter_type}"),
+        InlineKeyboardButton("📄 Краткое", callback_data=f"{CBT_LOT_SHORT}:{lot_id}:{page}:{filter_type}")
+    )
+    kb.row(
+        InlineKeyboardButton("🔄 Сменить статус", callback_data=f"{CBT_LOT_STATUS}:{lot_id}:{page}:{filter_type}"),
+        InlineKeyboardButton("🗑️ Деактивировать", callback_data=f"{CBT_LOT_DELETE}:{lot_id}:{page}:{filter_type}")
+    )
+    kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:{page}:{filter_type}"))
+    
+    cardinal.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+
+def show_stats(message):
+    """Показывает статистику по лотам"""
+    lots = get_cached_lots() or get_lots_from_profile()
+    if not lots:
+        cardinal.send_message(message.chat.id, "❌ Нет данных. Нажмите 'Загрузить лоты'")
+        return
+    
+    total = len(lots)
+    active = len([l for l in lots if l["active"]])
+    inactive = len([l for l in lots if not l["active"]])
+    
+    total_price = sum(l["price"] for l in lots)
+    total_count = sum(l["count"] for l in lots)
+    avg_price = total_price // total if total > 0 else 0
+    
+    # Категории
+    categories = {}
+    for lot in lots:
+        cat = lot.get("category", "Без категории")
+        categories[cat] = categories.get(cat, 0) + 1
+    
+    text = f"📊 **Статистика лотов**\n\n"
+    text += f"📌 **Всего лотов:** {total}\n"
+    text += f"🟢 **Активных:** {active}\n"
+    text += f"🔴 **Неактивных:** {inactive}\n"
+    text += f"💰 **Общая стоимость:** {total_price}₽\n"
+    text += f"💰 **Средняя цена:** {avg_price}₽\n"
+    text += f"📦 **Общее количество:** {total_count}\n\n"
+    
+    text += f"📂 **Категории:**\n"
+    for cat, count in categories.items():
+        text += f"   • {cat}: {count} лотов\n"
+    
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:0:all"))
+    
+    cardinal.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+
+# ============================================
+# 🔄 ОБРАБОТЧИКИ
+# ============================================
+
+def handle_lot_action(call, action, lot_id, page, filter_type="all"):
+    """Обрабатывает действия с лотом"""
+    
+    if action == "status":
+        lots = get_cached_lots() or get_lots_from_profile()
+        lot = next((l for l in lots if l["id"] == lot_id), None)
+        if lot:
+            new_status = not lot["active"]
+            if update_lot(lot_id, active=new_status):
+                status_text = "активирован" if new_status else "деактивирован"
+                bot.answer_callback_query(call.id, f"✅ Лот {status_text}")
+            else:
+                bot.answer_callback_query(call.id, "❌ Ошибка обновления")
+        show_lots_menu(call.message, int(page), filter_type)
+    
+    elif action == "delete":
+        # Деактивируем лот
+        if update_lot(lot_id, active=False):
+            bot.answer_callback_query(call.id, "✅ Лот деактивирован")
+        else:
+            bot.answer_callback_query(call.id, "❌ Ошибка")
+        show_lots_menu(call.message, int(page), filter_type)
+
+def handle_input(message):
+    """Обрабатывает ввод данных от пользователя"""
+    state = tg.get_state(message.chat.id, message.from_user.id)
+    if not state:
+        return
+    
+    action = state["action"]
+    data = state["data"]
+    lot_id = data.get("lot_id")
+    page = data.get("page", 0)
+    filter_type = data.get("filter_type", "all")
+    
+    try:
+        if action == WAITING_PRICE:
+            price = int(message.text.strip())
+            if update_lot(lot_id, price=price):
+                bot.reply_to(message, f"✅ Цена обновлена: {price}₽")
+            else:
+                bot.reply_to(message, "❌ Ошибка обновления цены")
+            show_lots_menu(message, int(page), filter_type)
+        
+        elif action == WAITING_COUNT:
+            count = int(message.text.strip())
+            if update_lot(lot_id, count=count):
+                bot.reply_to(message, f"✅ Количество обновлено: {count}")
+            else:
+                bot.reply_to(message, "❌ Ошибка обновления количества")
+            show_lots_menu(message, int(page), filter_type)
+        
+        elif action == WAITING_DESC:
+            desc = message.text.strip()
+            if update_lot(lot_id, description=desc):
+                bot.reply_to(message, "✅ Описание обновлено")
+            else:
+                bot.reply_to(message, "❌ Ошибка обновления описания")
+            show_lots_menu(message, int(page), filter_type)
+        
+        elif action == WAITING_SHORT:
+            short = message.text.strip()
+            if update_lot(lot_id, short_desc=short):
+                bot.reply_to(message, "✅ Краткое описание обновлено")
+            else:
+                bot.reply_to(message, "❌ Ошибка обновления краткого описания")
+            show_lots_menu(message, int(page), filter_type)
+    
+    except ValueError:
+        bot.reply_to(message, "❌ Введите число!")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+    
+    tg.clear_state(message.chat.id, message.from_user.id)
 
 # ============================================
 # 🚀 ИНИЦИАЛИЗАЦИЯ
 # ============================================
 
 def init_plugin(c):
-    global cardinal, tg, bot, queue_worker_running
+    global cardinal, tg, bot
     cardinal = c
     tg = c.telegram
     bot = c.telegram.bot
     
-    print("=" * 60)
-    print("[SG] 🔐 ЗАГРУЗКА SteamGuard Code v5.3")
-    print("[SG] 🛡️ ПОЛНАЯ ЗАЩИТА АКТИВИРОВАНА")
-    print("[SG] ⏳ РЕЖИМ ОЖИДАНИЯ: 3 МИНУТЫ")
-    print("[SG] 📋 ПОТОКОБЕЗОПАСНАЯ ОЧЕРЕДЬ")
-    print("=" * 60)
+    print("=" * 50)
+    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.1")
+    print("=" * 50)
     
     load_config()
     
-    ok, count = check_mail()
-    if ok:
-        print("[SG] ✅ Почта подключена")
-    else:
-        print("[SG] ❌ ПРОВЕРЬ ПАРОЛЬ ПРИЛОЖЕНИЯ!")
+    # Регистрация команд
+    c.add_telegram_commands(UUID, [
+        ("lots", "📦 Управление лотами", True),
+        ("lot_stats", "📊 Статистика лотов", True),
+        ("lot_load", "📥 Загрузить лоты", True)
+    ])
     
-    # 🔥 Запуск одного воркера очереди (НЕСКОЛЬКО ПОТОКОВ = БЛОКИРОВКА GMAIL!)
-    if not queue_worker_running:
-        queue_thread = threading.Thread(target=queue_worker, daemon=True)
-        queue_thread.start()
-        queue_worker_running = True
-        print("[SG] 🏭 Очередь запущена (1 поток)")
+    # Обработчики команд
+    tg.msg_handler(lambda m: show_lots_menu(m), commands=["lots"])
+    tg.msg_handler(lambda m: show_stats(m), commands=["lot_stats"])
+    tg.msg_handler(lambda m: show_lots_menu(m), commands=["lot_load"])
     
-    c.add_telegram_commands(UUID, [("sg", "🔐 SteamGuard", True)])
-    tg.msg_handler(show_menu, commands=["sg"])
+    # Обработчик ввода
+    tg.msg_handler(handle_input, func=lambda m: tg.check_state(m.chat.id, m.from_user.id))
     
-    @bot.callback_query_handler(func=lambda call: call.data == "sg_toggle")
-    def toggle(call):
-        SETTINGS["active"] = not SETTINGS["active"]
-        save_config()
-        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
-        show_menu(call.message)
+    # Обработчики кнопок
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_LIST))
+    def handle_list(call):
+        show_lots_menu(call.message)
+        bot.answer_callback_query(call.id)
     
-    @bot.callback_query_handler(func=lambda call: call.data == "sg_toggle_delete")
-    def toggle_delete(call):
-        SETTINGS["delete_after_use"] = not SETTINGS.get("delete_after_use", True)
-        save_config()
-        bot.answer_callback_query(call.id, f"{'ВКЛ' if SETTINGS['delete_after_use'] else 'ВЫКЛ'}")
-        show_menu(call.message)
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_EDIT))
+    def handle_edit(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        show_lot_edit(call.message, lot_id, page, filter_type)
+        bot.answer_callback_query(call.id)
     
-    @bot.callback_query_handler(func=lambda call: call.data == "sg_refresh")
-    def refresh(call):
-        bot.answer_callback_query(call.id, "Обновляю...")
-        show_menu(call.message)
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_PRICE))
+    def handle_price(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, f"💰 Введите новую цену для лота:\n\n`{lot_id}`")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_PRICE, {"lot_id": lot_id, "page": page, "filter_type": filter_type})
     
-    threading.Thread(target=chat_scanner, daemon=True).start()
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_COUNT))
+    def handle_count(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, f"📦 Введите новое количество для лота:\n\n`{lot_id}`")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_COUNT, {"lot_id": lot_id, "page": page, "filter_type": filter_type})
     
-    print("=" * 60)
-    print("[SG] ✅ ПЛАГИН ЗАГРУЖЕН!")
-    print("[SG] 📌 SGC — запрос кода (очередь + ожидание 3 мин)")
-    print("[SG] 📌 /sg — меню")
-    print("[SG] 🛡️ Защита от смены почты, телефона, аутентификатора")
-    print("[SG] 📋 Все запросы проходят через 1 поток → БЕЗ БЛОКИРОВОК GMAIL")
-    print("=" * 60)
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_STATUS))
+    def handle_status(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        handle_lot_action(call, "status", lot_id, page, filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_DESC))
+    def handle_desc(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, f"📝 Введите новое описание для лота:\n\n`{lot_id}`")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_DESC, {"lot_id": lot_id, "page": page, "filter_type": filter_type})
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_SHORT))
+    def handle_short(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, f"📄 Введите новое краткое описание для лота:\n\n`{lot_id}`")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_SHORT, {"lot_id": lot_id, "page": page, "filter_type": filter_type})
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_DELETE))
+    def handle_delete(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        handle_lot_action(call, "delete", lot_id, page, filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_REFRESH))
+    def handle_refresh(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        show_lots_menu(call.message, int(page), filter_type)
+        bot.answer_callback_query(call.id, "🔄 Обновлено")
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_BACK))
+    def handle_back(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        show_lots_menu(call.message, int(page), filter_type)
+        bot.answer_callback_query(call.id)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_PAGE))
+    def handle_page(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        show_lots_menu(call.message, int(page), filter_type)
+        bot.answer_callback_query(call.id)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_LOAD))
+    def handle_load(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        bot.answer_callback_query(call.id, "📥 Загрузка лотов...")
+        show_lots_menu(call.message, int(page), filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_FILTER))
+    def handle_filter(call):
+        parts = call.data.split(":")
+        filter_type, page = parts[1], parts[2]
+        show_lots_menu(call.message, int(page), filter_type)
+        bot.answer_callback_query(call.id)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_UPDATE))
+    def handle_update(call):
+        parts = call.data.split(":")
+        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
+        bot.answer_callback_query(call.id, "🔄 Синхронизация...")
+        get_lots_from_profile()
+        show_lots_menu(call.message, int(page), filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "LotManager_Stats")
+    def handle_stats(call):
+        show_stats(call.message)
+        bot.answer_callback_query(call.id)
+    
+    # Фоновое обновление
+    if SETTINGS.get("auto_update", True):
+        def auto_updater():
+            while True:
+                try:
+                    get_lots_from_profile()
+                    print(f"[LM] 🔄 Автообновление выполнено")
+                except Exception as e:
+                    print(f"[LM] ❌ Ошибка автообновления: {e}")
+                time.sleep(SETTINGS.get("update_interval", 60))
+        
+        threading.Thread(target=auto_updater, daemon=True).start()
+        print(f"[LM] 🔄 Автообновление: {SETTINGS.get('update_interval', 60)}с")
+    
+    print("[LM] ✅ Плагин загружен!")
+    print("[LM] 📌 Команды: /lots — список лотов, /lot_stats — статистика, /lot_load — загрузить лоты")
+    print("=" * 50)
+
+# ============================================
+# 🔗 ТОЧКИ ВХОДА
+# ============================================
 
 BIND_TO_PRE_INIT = [init_plugin]
 BIND_TO_DELETE = None
