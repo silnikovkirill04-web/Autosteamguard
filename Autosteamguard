@@ -1,6 +1,7 @@
 """
-Lot Manager v1.3 — Управление лотами FunPay
-Управление ценой, количеством, статусом и описанием лотов
+Lot Manager v1.6 — Управление лотами FunPay
+Загрузка лотов из реальной структуры JSON Cardinal
+Двойное подтверждение удаления лотов
 """
 import uuid as uuid_lib
 import json
@@ -13,8 +14,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from tg_bot.utils import escape
 
 NAME = "Lot Manager"
-VERSION = "1.3.0"
-DESCRIPTION = "Управление лотами FunPay: цена, количество, статус, описание"
+VERSION = "1.6.0"
+DESCRIPTION = "Управление лотами FunPay: цена, количество, статус, описание, удаление"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
@@ -43,6 +44,8 @@ CBT_LOT_STATUS = "LotManager_Status"
 CBT_LOT_DESC = "LotManager_Desc"
 CBT_LOT_SHORT = "LotManager_Short"
 CBT_LOT_DELETE = "LotManager_Delete"
+CBT_LOT_DELETE_CONFIRM = "LotManager_DeleteConfirm"
+CBT_LOT_DELETE_CANCEL = "LotManager_DeleteCancel"
 CBT_LOT_REFRESH = "LotManager_Refresh"
 CBT_LOT_BACK = "LotManager_Back"
 CBT_LOT_PAGE = "LotManager_Page"
@@ -91,76 +94,97 @@ def escape_markdown(text):
     return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
 
 def get_lots_from_profile():
-    """Ультимативный парсинг лотов через прямой HTTP-запрос (requests)"""
+    """Загрузка лотов на основе реальной структуры JSON Cardinal"""
     try:
-        print("[LM] 🔄 Ультимативный парсинг лотов через HTTP...")
+        print("[LM] 🔄 Загрузка лотов из JSON структуры Cardinal...")
         
-        # Проверка авторизации
         if not cardinal.account or not cardinal.account.golden_key:
             print("[LM] ❌ Аккаунт не авторизован")
             return []
         
-        # 🔥 ПРЯМОЙ HTTP-ЗАПРОС к странице продавца
         session = cardinal.account.api.session
-        response = session.get("https://funpay.com", timeout=10)
+        response = session.get("https://funpay.com/sell/", timeout=10)
         
-        print(f"[LM] 📡 Статус ответа: {response.status_code}")
-        
-        if response.status_code == 200:
-            # 🔥 ПАРСИМ ID лотов регуляркой из HTML
-            # Ищем все node=XXXXXX в ссылках на лоты
-            node_ids = re.findall(r'node=(\d+)', response.text)
-            
-            if node_ids:
-                # Убираем дубликаты
-                unique_ids = list(set(node_ids))
-                print(f"[LM] 🔍 Найдено {len(unique_ids)} уникальных ID лотов в HTML")
-                
-                lots = []
-                for nid in unique_ids:
-                    try:
-                        lot = cardinal.account.get_lot(nid)
-                        if lot:
-                            lots.append(lot)
-                    except Exception as e:
-                        print(f"[LM] ⚠️ Не удалось загрузить лот {nid}: {e}")
-                
-                if lots:
-                    print(f"[LM] ✅ Успешно загружено {len(lots)} лотов через HTML парсинг")
-                    
-                    # Сохраняем в кэш
-                    result = []
-                    for lot in lots:
-                        lot_data = {
-                            "id": lot.id,
-                            "name": lot.name,
-                            "price": lot.price,
-                            "count": lot.count,
-                            "active": lot.active,
-                            "description": lot.description or "",
-                            "short_desc": getattr(lot, 'short_description', '') or "",
-                            "category": getattr(lot, 'category', 'Без категории') or "Без категории",
-                            "updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-                        }
-                        result.append(lot_data)
-                        SETTINGS["lots_cache"][lot.id] = lot_data
-                    
-                    save_config()
-                    return result
-                else:
-                    print("[LM] ❌ Не удалось загрузить детали лотов")
-                    return []
-            else:
-                print("[LM] ❌ В HTML не найдены ID лотов")
-                print("[LM] 💡 Проверь, есть ли у тебя созданные лоты на FunPay")
-                return []
-        else:
+        if response.status_code != 200:
             print(f"[LM] ❌ Ошибка HTTP: статус {response.status_code}")
-            print("[LM] 💡 Возможные причины: Cloudflare, блокировка, сессия истекла")
             return []
         
+        lot_pattern = r'data-lot=\'([^\']+)\''
+        lot_matches = re.findall(lot_pattern, response.text)
+        
+        if not lot_matches:
+            print("[LM] ❌ JSON лотов не найдены в HTML")
+            return []
+        
+        print(f"[LM] 🔍 Найдено {len(lot_matches)} JSON-записей лотов")
+        
+        result = []
+        for lot_json in lot_matches:
+            try:
+                lot_data = json.loads(lot_json)
+                
+                node_id = lot_data.get("node_id", "")
+                
+                fields = lot_data.get("fields", {})
+                summary = fields.get("summary", {})
+                name = summary.get("ru", summary.get("en", "Без названия"))
+                
+                amount = lot_data.get("amount", "0")
+                try:
+                    count = int(amount)
+                except:
+                    count = 0
+                
+                price = lot_data.get("price", "0")
+                try:
+                    price = int(price)
+                except:
+                    price = 0
+                
+                active = lot_data.get("active", "off") == "on"
+                
+                payment_msg = fields.get("payment_msg", {})
+                description = payment_msg.get("ru", payment_msg.get("en", ""))
+                
+                desc = fields.get("desc", {})
+                short_desc = desc.get("ru", desc.get("en", ""))
+                
+                category = f"Категория ID: {node_id}"
+                
+                lot_entry = {
+                    "id": node_id,
+                    "name": name,
+                    "price": price,
+                    "count": count,
+                    "active": active,
+                    "description": description,
+                    "short_desc": short_desc,
+                    "category": category,
+                    "updated": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                }
+                
+                result.append(lot_entry)
+                
+                SETTINGS["lots_cache"][node_id] = lot_entry
+                print(f"[LM] ✅ Загружен лот: {name[:30]}... (ID: {node_id})")
+                
+            except json.JSONDecodeError as e:
+                print(f"[LM] ⚠️ Ошибка парсинга JSON: {e}")
+                continue
+            except Exception as e:
+                print(f"[LM] ⚠️ Ошибка обработки лота: {e}")
+                continue
+        
+        if result:
+            save_config()
+            print(f"[LM] ✅ Успешно загружено {len(result)} лотов")
+        else:
+            print("[LM] ❌ Не удалось загрузить ни одного лота")
+        
+        return result
+        
     except Exception as e:
-        print(f"[LM] ❌ Сбой парсинга: {e}")
+        print(f"[LM] ❌ Сбой загрузки: {e}")
         import traceback
         traceback.print_exc()
         return []
@@ -191,7 +215,6 @@ def update_lot(lot_id, **kwargs):
         
         cardinal.account.save_lot(lot)
         
-        # Обновляем кэш
         if lot_id in SETTINGS["lots_cache"]:
             for key, value in kwargs.items():
                 if key in SETTINGS["lots_cache"][lot_id]:
@@ -206,13 +229,28 @@ def update_lot(lot_id, **kwargs):
         print(f"[LM] ❌ Ошибка обновления лота {lot_id}: {e}")
         return False
 
-def format_lot_name(name, active=True, max_len=35):
-    """Форматирует название лота с указанием статуса"""
-    display = escape_markdown(name[:max_len] + "..." if len(name) > max_len else name)
-    if active:
-        return f"🟢 `{display}`"
-    else:
-        return f"🔴 `{display}`"
+def delete_lot(lot_id):
+    """Удаляет лот"""
+    try:
+        lot = cardinal.account.get_lot(lot_id)
+        if not lot:
+            print(f"[LM] ❌ Лот {lot_id} не найден")
+            return False
+        
+        # Удаляем лот
+        cardinal.account.delete_lot(lot)
+        
+        # Удаляем из кэша
+        if lot_id in SETTINGS["lots_cache"]:
+            del SETTINGS["lots_cache"][lot_id]
+            save_config()
+        
+        print(f"[LM] 🗑️ Лот {lot_id} успешно удален")
+        return True
+        
+    except Exception as e:
+        print(f"[LM] ❌ Ошибка удаления лота {lot_id}: {e}")
+        return False
 
 # ============================================
 # 📱 ИНТЕРФЕЙС
@@ -243,16 +281,15 @@ def show_lots_menu(message, page=0, filter_type="all"):
     
     bot.delete_message(message.chat.id, loading_msg.id)
     
-    # Фильтрация
     if filter_type == "active":
-        filtered = [l for l in lots if l["active"]]
+        filtered = [l for l in lots if l.get("active", False)]
     elif filter_type == "inactive":
-        filtered = [l for l in lots if not l["active"]]
+        filtered = [l for l in lots if not l.get("active", False)]
     else:
         filtered = lots
     
-    active_lots = [l for l in filtered if l["active"]]
-    inactive_lots = [l for l in filtered if not l["active"]]
+    active_lots = [l for l in filtered if l.get("active", False)]
+    inactive_lots = [l for l in filtered if not l.get("active", False)]
     sorted_lots = active_lots + inactive_lots
     
     per_page = 5
@@ -269,8 +306,8 @@ def show_lots_menu(message, page=0, filter_type="all"):
     page_lots = sorted_lots[start:end]
     
     total = len(lots)
-    total_active = len([l for l in lots if l["active"]])
-    total_inactive = len([l for l in lots if not l["active"]])
+    total_active = len([l for l in lots if l.get("active", False)])
+    total_inactive = len([l for l in lots if not l.get("active", False)])
     
     filter_names = {
         "all": "Все",
@@ -286,16 +323,16 @@ def show_lots_menu(message, page=0, filter_type="all"):
         text += "❌ Нет лотов в этой категории\n"
     else:
         for i, lot in enumerate(page_lots, start + 1):
-            name = escape_markdown(lot['name'])
+            name = escape_markdown(lot.get('name', 'Без названия'))
             category = escape_markdown(lot.get('category', 'Без категории'))
-            status_icon = "🟢" if lot['active'] else "🔴"
-            status_text = "Активен" if lot['active'] else "Неактивен"
+            status_icon = "🟢" if lot.get('active', False) else "🔴"
+            status_text = "Активен" if lot.get('active', False) else "Неактивен"
             
             text += f"**{i}. {status_icon} `{name}`**\n"
-            text += f"   💰 {lot['price']}₽ | 📦 {lot['count']} шт.\n"
+            text += f"   💰 {lot.get('price', 0)}₽ | 📦 {lot.get('count', 0)} шт.\n"
             text += f"   📌 {status_icon} {status_text}\n"
             text += f"   📂 {category}\n"
-            text += f"   🆔 `{lot['id']}`\n\n"
+            text += f"   🆔 `{lot.get('id', '')}`\n\n"
     
     kb = InlineKeyboardMarkup(row_width=3)
     
@@ -314,12 +351,13 @@ def show_lots_menu(message, page=0, filter_type="all"):
         kb.row(*nav_buttons)
     
     for lot in page_lots:
-        lot_id = lot["id"]
-        name_short = escape_markdown(lot['name'][:12])
-        status_btn = "🔴 Выкл" if lot["active"] else "🟢 Вкл"
+        lot_id = lot.get("id", "")
+        name_short = escape_markdown(lot.get('name', 'Без названия')[:12])
+        status_btn = "🔴 Выкл" if lot.get('active', False) else "🟢 Вкл"
         kb.row(
             InlineKeyboardButton(f"✏️ {name_short}", callback_data=f"{CBT_LOT_EDIT}:{lot_id}:{page}:{filter_type}"),
-            InlineKeyboardButton(status_btn, callback_data=f"{CBT_LOT_STATUS}:{lot_id}:{page}:{filter_type}")
+            InlineKeyboardButton(f"{status_btn}", callback_data=f"{CBT_LOT_STATUS}:{lot_id}:{page}:{filter_type}"),
+            InlineKeyboardButton("🗑️", callback_data=f"{CBT_LOT_DELETE}:{lot_id}:{page}:{filter_type}")
         )
     
     kb.row(
@@ -336,22 +374,22 @@ def show_lots_menu(message, page=0, filter_type="all"):
 def show_lot_edit(message, lot_id, page, filter_type="all"):
     """Показывает меню редактирования лота"""
     lots = get_cached_lots() or get_lots_from_profile()
-    lot = next((l for l in lots if l["id"] == lot_id), None)
+    lot = next((l for l in lots if l.get("id") == lot_id), None)
     if not lot:
         bot.send_message(message.chat.id, "❌ Лот не найден")
         return
     
-    status = "🟢 Активен" if lot["active"] else "🔴 Неактивен"
-    name = escape_markdown(lot['name'])
+    status = "🟢 Активен" if lot.get('active', False) else "🔴 Неактивен"
+    name = escape_markdown(lot.get('name', 'Без названия'))
     category = escape_markdown(lot.get('category', 'Без категории'))
     
     text = f"**✏️ Редактирование лота**\n\n"
     text += f"📌 **Название:** {name}\n"
-    text += f"💰 **Цена:** {lot['price']}₽\n"
-    text += f"📦 **Количество:** {lot['count']} шт.\n"
+    text += f"💰 **Цена:** {lot.get('price', 0)}₽\n"
+    text += f"📦 **Количество:** {lot.get('count', 0)} шт.\n"
     text += f"📌 **Статус:** {status}\n"
     text += f"📂 **Категория:** {category}\n"
-    text += f"🆔 **ID:** `{lot['id']}`\n"
+    text += f"🆔 **ID:** `{lot.get('id', '')}`\n"
     text += f"🕐 **Обновлен:** {lot.get('updated', '')}\n\n"
     
     if lot.get('description'):
@@ -377,11 +415,81 @@ def show_lot_edit(message, lot_id, page, filter_type="all"):
     )
     kb.row(
         InlineKeyboardButton("🔄 Сменить статус", callback_data=f"{CBT_LOT_STATUS}:{lot_id}:{page}:{filter_type}"),
-        InlineKeyboardButton("🗑️ Деактивировать", callback_data=f"{CBT_LOT_DELETE}:{lot_id}:{page}:{filter_type}")
+        InlineKeyboardButton("🗑️ Удалить лот", callback_data=f"{CBT_LOT_DELETE}:{lot_id}:{page}:{filter_type}")
     )
     kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:{page}:{filter_type}"))
     
     bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+
+def show_delete_confirmation(call, lot_id, page, filter_type):
+    """Показывает окно подтверждения удаления (ПЕРВЫЙ ШАГ)"""
+    lots = get_cached_lots() or get_lots_from_profile()
+    lot = next((l for l in lots if l.get("id") == lot_id), None)
+    if not lot:
+        bot.answer_callback_query(call.id, "❌ Лот не найден")
+        return
+    
+    name = escape_markdown(lot.get('name', 'Без названия'))
+    
+    text = f"⚠️ **ВЫ УВЕРЕНЫ, ЧТО ХОТИТЕ УДАЛИТЬ ЛОТ?**\n\n"
+    text += f"📌 **Название:** {name}\n"
+    text += f"🆔 **ID:** `{lot_id}`\n\n"
+    text += f"❗️ Это действие **НЕЛЬЗЯ ОТМЕНИТЬ**!\n"
+    text += f"Лот будет полностью удален с FunPay."
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("✅ ДА, УДАЛИТЬ", callback_data=f"{CBT_LOT_DELETE_CONFIRM}:{lot_id}:{page}:{filter_type}"),
+        InlineKeyboardButton("❌ ОТМЕНА", callback_data=f"{CBT_LOT_DELETE_CANCEL}:{lot_id}:{page}:{filter_type}")
+    )
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.id, reply_markup=kb, parse_mode="Markdown")
+    bot.answer_callback_query(call.id)
+
+def handle_delete_confirm(call, lot_id, page, filter_type):
+    """Обрабатывает подтверждение удаления (ВТОРОЙ ШАГ)"""
+    try:
+        # Пытаемся удалить лот
+        if delete_lot(lot_id):
+            # Удаляем из кэша
+            if lot_id in SETTINGS["lots_cache"]:
+                del SETTINGS["lots_cache"][lot_id]
+                save_config()
+            
+            bot.edit_message_text(
+                f"✅ **Лот {lot_id} успешно удален!**",
+                call.message.chat.id,
+                call.message.id
+            )
+            bot.answer_callback_query(call.id, "🗑️ Лот удален!")
+            
+            # Показываем обновленный список
+            show_lots_menu(call.message, int(page), filter_type)
+        else:
+            bot.edit_message_text(
+                f"❌ **Ошибка при удалении лота {lot_id}**",
+                call.message.chat.id,
+                call.message.id
+            )
+            bot.answer_callback_query(call.id, "❌ Ошибка удаления")
+            
+    except Exception as e:
+        bot.edit_message_text(
+            f"❌ **Ошибка:** {e}",
+            call.message.chat.id,
+            call.message.id
+        )
+        bot.answer_callback_query(call.id, "❌ Ошибка")
+
+def handle_delete_cancel(call, lot_id, page, filter_type):
+    """Отменяет удаление лота"""
+    bot.edit_message_text(
+        "✅ **Удаление отменено**",
+        call.message.chat.id,
+        call.message.id
+    )
+    bot.answer_callback_query(call.id, "❌ Отменено")
+    show_lots_menu(call.message, int(page), filter_type)
 
 def show_stats(message):
     """Показывает статистику по лотам"""
@@ -391,11 +499,11 @@ def show_stats(message):
         return
     
     total = len(lots)
-    active = len([l for l in lots if l["active"]])
-    inactive = len([l for l in lots if not l["active"]])
+    active = len([l for l in lots if l.get('active', False)])
+    inactive = len([l for l in lots if not l.get('active', False)])
     
-    total_price = sum(l["price"] for l in lots)
-    total_count = sum(l["count"] for l in lots)
+    total_price = sum(l.get('price', 0) for l in lots)
+    total_count = sum(l.get('count', 0) for l in lots)
     avg_price = total_price // total if total > 0 else 0
     
     categories = {}
@@ -430,21 +538,14 @@ def handle_lot_action(call, action, lot_id, page, filter_type="all"):
     
     if action == "status":
         lots = get_cached_lots() or get_lots_from_profile()
-        lot = next((l for l in lots if l["id"] == lot_id), None)
+        lot = next((l for l in lots if l.get("id") == lot_id), None)
         if lot:
-            new_status = not lot["active"]
+            new_status = not lot.get('active', False)
             if update_lot(lot_id, active=new_status):
                 status_text = "активирован" if new_status else "деактивирован"
                 bot.answer_callback_query(call.id, f"✅ Лот {status_text}")
             else:
                 bot.answer_callback_query(call.id, "❌ Ошибка обновления")
-        show_lots_menu(call.message, int(page), filter_type)
-    
-    elif action == "delete":
-        if update_lot(lot_id, active=False):
-            bot.answer_callback_query(call.id, "✅ Лот деактивирован")
-        else:
-            bot.answer_callback_query(call.id, "❌ Ошибка")
         show_lots_menu(call.message, int(page), filter_type)
 
 def handle_input(message):
@@ -510,8 +611,9 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.3")
-    print("[LM] 🔥 Ультимативный парсинг лотов")
+    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.6")
+    print("[LM] 🔥 Загрузка из реальной JSON структуры Cardinal")
+    print("[LM] 🗑️ Двойное подтверждение удаления")
     print("=" * 50)
     
     load_config()
@@ -581,7 +683,19 @@ def init_plugin(c):
     def handle_delete(call):
         parts = call.data.split(":")
         lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
-        handle_lot_action(call, "delete", lot_id, page, filter_type)
+        show_delete_confirmation(call, lot_id, page, filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_DELETE_CONFIRM))
+    def handle_delete_confirm(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        handle_delete_confirm(call, lot_id, page, filter_type)
+    
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_DELETE_CANCEL))
+    def handle_delete_cancel(call):
+        parts = call.data.split(":")
+        lot_id, page, filter_type = parts[1], parts[2], parts[3] if len(parts) > 3 else "all"
+        handle_delete_cancel(call, lot_id, page, filter_type)
     
     @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_REFRESH))
     def handle_refresh(call):
@@ -647,6 +761,7 @@ def init_plugin(c):
     
     print("[LM] ✅ Плагин загружен!")
     print("[LM] 📌 Команды: /lots, /lot_stats, /lot_load")
+    print("[LM] 🗑️ Для удаления: кнопка 🗑️ → подтверждение → ДА, УДАЛИТЬ")
     print("=" * 50)
 
 # ============================================
