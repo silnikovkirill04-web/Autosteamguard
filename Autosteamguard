@@ -1,7 +1,6 @@
 """
-Lot Manager v1.6 — Управление лотами FunPay
-Загрузка лотов из реальной структуры JSON Cardinal
-Двойное подтверждение удаления лотов
+Lot Manager v1.7 — Управление лотами FunPay
+Автономное чтение лотов из системного кэша Cardinal
 """
 import uuid as uuid_lib
 import json
@@ -14,13 +13,14 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from tg_bot.utils import escape
 
 NAME = "Lot Manager"
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 DESCRIPTION = "Управление лотами FunPay: цена, количество, статус, описание, удаление"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
 
 CONFIG_PATH = "storage/cache/lot_manager.json"
+LOTS_CACHE_PATH = "storage/cache/lots.json"
 
 cardinal = None
 tg = None
@@ -94,62 +94,64 @@ def escape_markdown(text):
     return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
 
 def get_lots_from_profile():
-    """Загрузка лотов на основе реальной структуры JSON Cardinal"""
+    """Автономное чтение лотов из системного кэша Cardinal (lots.json)"""
     try:
-        print("[LM] 🔄 Загрузка лотов из JSON структуры Cardinal...")
+        print("[LM] 🔄 Чтение лотов из системного кэша Cardinal...")
         
-        if not cardinal.account or not cardinal.account.golden_key:
-            print("[LM] ❌ Аккаунт не авторизован")
+        # 🔥 Проверяем наличие файла кэша
+        if not os.path.exists(LOTS_CACHE_PATH):
+            print(f"[LM] ❌ Файл кэша не найден: {LOTS_CACHE_PATH}")
+            print("[LM] 💡 Подожди, пока Cardinal загрузит лоты, или обнови golden_key")
             return []
         
-        session = cardinal.account.api.session
-        response = session.get("https://funpay.com/sell/", timeout=10)
+        # 🔥 Читаем файл кэша
+        with open(LOTS_CACHE_PATH, "r", encoding="utf-8") as f:
+            cardinal_lots = json.load(f)
         
-        if response.status_code != 200:
-            print(f"[LM] ❌ Ошибка HTTP: статус {response.status_code}")
+        if not cardinal_lots:
+            print("[LM] ❌ Кэш пуст")
             return []
         
-        lot_pattern = r'data-lot=\'([^\']+)\''
-        lot_matches = re.findall(lot_pattern, response.text)
-        
-        if not lot_matches:
-            print("[LM] ❌ JSON лотов не найдены в HTML")
-            return []
-        
-        print(f"[LM] 🔍 Найдено {len(lot_matches)} JSON-записей лотов")
+        print(f"[LM] 🔍 Найдено {len(cardinal_lots)} записей в кэше")
         
         result = []
-        for lot_json in lot_matches:
+        for item in cardinal_lots:
             try:
-                lot_data = json.loads(lot_json)
-                
-                node_id = lot_data.get("node_id", "")
-                
-                fields = lot_data.get("fields", {})
+                # 🔥 Извлекаем данные по структуре из скриншота
+                node_id = item.get("node_id", "")
+                fields = item.get("fields", {})
                 summary = fields.get("summary", {})
+                
+                # Название (русское или английское)
                 name = summary.get("ru", summary.get("en", "Без названия"))
                 
-                amount = lot_data.get("amount", "0")
-                try:
-                    count = int(amount)
-                except:
-                    count = 0
-                
-                price = lot_data.get("price", "0")
+                # Цена
+                price = item.get("price", "0")
                 try:
                     price = int(price)
                 except:
                     price = 0
                 
-                active = lot_data.get("active", "off") == "on"
+                # Количество
+                amount = item.get("amount", "0")
+                try:
+                    count = int(amount)
+                except:
+                    count = 0
                 
-                payment_msg = fields.get("payment_msg", {})
-                description = payment_msg.get("ru", payment_msg.get("en", ""))
+                # Статус (активен/неактивен)
+                active = item.get("active") in ["on", True]
                 
+                # Описание (desc)
                 desc = fields.get("desc", {})
-                short_desc = desc.get("ru", desc.get("en", ""))
+                description = desc.get("ru", desc.get("en", ""))
                 
-                category = f"Категория ID: {node_id}"
+                # Сообщение после оплаты (payment_msg)
+                payment_msg = fields.get("payment_msg", {})
+                short_desc = payment_msg.get("ru", payment_msg.get("en", ""))
+                
+                # Категория
+                category = f"Категория ID: {node_id}" if node_id else "Без категории"
                 
                 lot_entry = {
                     "id": node_id,
@@ -165,24 +167,28 @@ def get_lots_from_profile():
                 
                 result.append(lot_entry)
                 
-                SETTINGS["lots_cache"][node_id] = lot_entry
-                print(f"[LM] ✅ Загружен лот: {name[:30]}... (ID: {node_id})")
+                # Сохраняем в кэш плагина
+                if node_id:
+                    SETTINGS["lots_cache"][node_id] = lot_entry
                 
-            except json.JSONDecodeError as e:
-                print(f"[LM] ⚠️ Ошибка парсинга JSON: {e}")
-                continue
+                print(f"[LM] ✅ Загружен лот: {name[:30]}... (ID: {node_id}, цена: {price}₽, кол-во: {count})")
+                
             except Exception as e:
                 print(f"[LM] ⚠️ Ошибка обработки лота: {e}")
                 continue
         
         if result:
             save_config()
-            print(f"[LM] ✅ Успешно загружено {len(result)} лотов")
+            print(f"[LM] ✅ Успешно загружено {len(result)} лотов из системного кэша")
         else:
             print("[LM] ❌ Не удалось загрузить ни одного лота")
+            print("[LM] 💡 Проверь файл: storage/cache/lots.json")
         
         return result
         
+    except json.JSONDecodeError as e:
+        print(f"[LM] ❌ Ошибка парсинга JSON: {e}")
+        return []
     except Exception as e:
         print(f"[LM] ❌ Сбой загрузки: {e}")
         import traceback
@@ -190,15 +196,15 @@ def get_lots_from_profile():
         return []
 
 def get_cached_lots():
-    """Возвращает лоты из кэша"""
+    """Возвращает лоты из кэша плагина"""
     return list(SETTINGS.get("lots_cache", {}).values())
 
 def update_lot(lot_id, **kwargs):
-    """Обновляет параметры лота"""
+    """Обновляет параметры лота через API Cardinal"""
     try:
         lot = cardinal.account.get_lot(lot_id)
         if not lot:
-            print(f"[LM] ❌ Лот {lot_id} не найден")
+            print(f"[LM] ❌ Лот {lot_id} не найден в API")
             return False
         
         for key, value in kwargs.items():
@@ -215,6 +221,7 @@ def update_lot(lot_id, **kwargs):
         
         cardinal.account.save_lot(lot)
         
+        # Обновляем кэш плагина
         if lot_id in SETTINGS["lots_cache"]:
             for key, value in kwargs.items():
                 if key in SETTINGS["lots_cache"][lot_id]:
@@ -230,17 +237,15 @@ def update_lot(lot_id, **kwargs):
         return False
 
 def delete_lot(lot_id):
-    """Удаляет лот"""
+    """Удаляет лот через API Cardinal"""
     try:
         lot = cardinal.account.get_lot(lot_id)
         if not lot:
-            print(f"[LM] ❌ Лот {lot_id} не найден")
+            print(f"[LM] ❌ Лот {lot_id} не найден в API")
             return False
         
-        # Удаляем лот
         cardinal.account.delete_lot(lot)
         
-        # Удаляем из кэша
         if lot_id in SETTINGS["lots_cache"]:
             del SETTINGS["lots_cache"][lot_id]
             save_config()
@@ -259,7 +264,7 @@ def delete_lot(lot_id):
 def show_lots_menu(message, page=0, filter_type="all"):
     """Показывает список лотов с пагинацией и фильтрацией"""
     
-    loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка лотов из профиля...")
+    loading_msg = bot.send_message(message.chat.id, "⏳ Загрузка лотов из кэша Cardinal...")
     lots = get_lots_from_profile()
     
     if not lots:
@@ -270,10 +275,11 @@ def show_lots_menu(message, page=0, filter_type="all"):
         bot.send_message(
             message.chat.id, 
             "❌ Лотов не найдено.\n\n"
-            "💡 Убедись, что:\n"
-            "1. У тебя есть созданные лоты на FunPay\n"
-            "2. Ты залогинен в Cardinal\n"
-            "3. Сессия FunPay активна\n\n"
+            "💡 Проверь:\n"
+            "1. Файл storage/cache/lots.json существует\n"
+            "2. В нем есть данные о лотах\n"
+            "3. Ты залогинен в Cardinal\n"
+            "4. Подожди 15-20 секунд после запуска\n\n"
             "📝 Создать лот можно по ссылке ниже",
             reply_markup=kb
         )
@@ -449,9 +455,7 @@ def show_delete_confirmation(call, lot_id, page, filter_type):
 def handle_delete_confirm(call, lot_id, page, filter_type):
     """Обрабатывает подтверждение удаления (ВТОРОЙ ШАГ)"""
     try:
-        # Пытаемся удалить лот
         if delete_lot(lot_id):
-            # Удаляем из кэша
             if lot_id in SETTINGS["lots_cache"]:
                 del SETTINGS["lots_cache"][lot_id]
                 save_config()
@@ -462,8 +466,6 @@ def handle_delete_confirm(call, lot_id, page, filter_type):
                 call.message.id
             )
             bot.answer_callback_query(call.id, "🗑️ Лот удален!")
-            
-            # Показываем обновленный список
             show_lots_menu(call.message, int(page), filter_type)
         else:
             bot.edit_message_text(
@@ -611,12 +613,25 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.6")
-    print("[LM] 🔥 Загрузка из реальной JSON структуры Cardinal")
+    print("[LM] 📦 ЗАГРУЗКА Lot Manager v1.7")
+    print("[LM] 🔥 Автономное чтение из системного кэша Cardinal")
     print("[LM] 🗑️ Двойное подтверждение удаления")
     print("=" * 50)
     
     load_config()
+    
+    # Проверяем наличие файла кэша
+    if os.path.exists(LOTS_CACHE_PATH):
+        print(f"[LM] ✅ Файл кэша найден: {LOTS_CACHE_PATH}")
+        try:
+            with open(LOTS_CACHE_PATH, "r", encoding="utf-8") as f:
+                test_data = json.load(f)
+                print(f"[LM] 📊 В кэше {len(test_data)} записей")
+        except Exception as e:
+            print(f"[LM] ⚠️ Ошибка чтения кэша: {e}")
+    else:
+        print(f"[LM] ⚠️ Файл кэша НЕ НАЙДЕН: {LOTS_CACHE_PATH}")
+        print("[LM] 💡 Подожди, пока Cardinal загрузит лоты, или обнови golden_key")
     
     c.add_telegram_commands(UUID, [
         ("lots", "📦 Управление лотами", True),
@@ -762,6 +777,7 @@ def init_plugin(c):
     print("[LM] ✅ Плагин загружен!")
     print("[LM] 📌 Команды: /lots, /lot_stats, /lot_load")
     print("[LM] 🗑️ Для удаления: кнопка 🗑️ → подтверждение → ДА, УДАЛИТЬ")
+    print(f"[LM] 📁 Чтение из: {LOTS_CACHE_PATH}")
     print("=" * 50)
 
 # ============================================
