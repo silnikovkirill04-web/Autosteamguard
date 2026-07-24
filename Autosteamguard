@@ -101,19 +101,32 @@ def get_lots_from_profile():
             print("[LM] 💡 Подожди 15-20 секунд после старта Cardinal")
             return []
         
-        # 🔥 ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ
         lots = None
         
-        # Вариант 1: force_download
+        # 🔥 ВАРИАНТ 1: Проверяем прямое хранилище лотов Cardinal
         try:
-            lots = cardinal.account.get_lots(force_download=True)
-            if lots:
-                print(f"[LM] ✅ Загружено {len(lots)} лотов (force_download)")
-        except TypeError:
-            pass
+            if hasattr(cardinal, 'lots') and cardinal.lots:
+                if isinstance(cardinal.lots, dict):
+                    lots = list(cardinal.lots.values())
+                else:
+                    lots = cardinal.lots
+                print(f"[LM] ✅ Взято {len(lots)} лотов из ядра Cardinal")
+        except Exception as e:
+            print(f"[LM] ⚠️ Не удалось получить лоты из ядра: {e}")
         
-        # Вариант 2: load_lots
-        if lots is None:
+        # 🔥 ВАРИАНТ 2: force_download
+        if lots is None or len(lots) == 0:
+            try:
+                lots = cardinal.account.get_lots(force_download=True)
+                if lots:
+                    print(f"[LM] ✅ Загружено {len(lots)} лотов (force_download)")
+            except TypeError:
+                pass
+            except Exception as e:
+                print(f"[LM] ⚠️ force_download не сработал: {e}")
+        
+        # 🔥 ВАРИАНТ 3: load_lots
+        if lots is None or len(lots) == 0:
             try:
                 if hasattr(cardinal.account, 'load_lots'):
                     cardinal.account.load_lots()
@@ -123,8 +136,8 @@ def get_lots_from_profile():
             except Exception as e:
                 print(f"[LM] ⚠️ load_lots не сработал: {e}")
         
-        # Вариант 3: обычный get_lots
-        if lots is None:
+        # 🔥 ВАРИАНТ 4: обычный get_lots
+        if lots is None or len(lots) == 0:
             try:
                 lots = cardinal.account.get_lots()
                 if lots:
@@ -132,12 +145,13 @@ def get_lots_from_profile():
             except Exception as e:
                 print(f"[LM] ❌ Ошибка get_lots: {e}")
         
-        if not lots:
+        if not lots or len(lots) == 0:
             print("[LM] ❌ Лотов не найдено.")
             print("[LM] 💡 Проверь:")
-            print("[LM]    1. Консоль Cardinal на ошибки (Cloudflare, 403)")
-            print("[LM]    2. Golden_key в настройках Cardinal")
-            print("[LM]    3. Подожди 15-20 секунд после запуска")
+            print("[LM]    1. Есть ли у тебя созданные лоты на FunPay")
+            print("[LM]    2. Консоль Cardinal на ошибки (Cloudflare, 403)")
+            print("[LM]    3. Golden_key в настройках Cardinal")
+            print("[LM]    4. Подожди 15-20 секунд после запуска")
             return []
         
         result = []
@@ -234,7 +248,8 @@ def show_lots_menu(message, page=0, filter_type="all"):
         bot.edit_message_text("❌ Нет доступных лотов или ошибка подключения к FunPay", message.chat.id, loading_msg.id)
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"{CBT_LOT_LOAD}:0:all"))
-        cardinal.send_message(message.chat.id, "❌ Лотов не найдено", reply_markup=kb)
+        # 🔥 ИСПРАВЛЕНО: используем bot, а не cardinal
+        bot.send_message(message.chat.id, "❌ Лотов не найдено. Создайте хотя бы один лот на FunPay.", reply_markup=kb)
         return
     
     bot.delete_message(message.chat.id, loading_msg.id)
@@ -335,14 +350,16 @@ def show_lots_menu(message, page=0, filter_type="all"):
         InlineKeyboardButton("🔄 Синхронизировать", callback_data=f"{CBT_LOT_UPDATE}:{page}:{filter_type}")
     )
     
-    cardinal.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+    # 🔥 ИСПРАВЛЕНО: используем bot, а не cardinal
+    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
 
 def show_lot_edit(message, lot_id, page, filter_type="all"):
     """Показывает меню редактирования лота"""
     lots = get_cached_lots() or get_lots_from_profile()
     lot = next((l for l in lots if l["id"] == lot_id), None)
     if not lot:
-        cardinal.send_message(message.chat.id, "❌ Лот не найден")
+        # 🔥 ИСПРАВЛЕНО: используем bot
+        bot.send_message(message.chat.id, "❌ Лот не найден")
         return
     
     status = "🟢 Активен" if lot["active"] else "🔴 Неактивен"
@@ -385,13 +402,15 @@ def show_lot_edit(message, lot_id, page, filter_type="all"):
     )
     kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:{page}:{filter_type}"))
     
-    cardinal.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+    # 🔥 ИСПРАВЛЕНО: используем bot
+    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
 
 def show_stats(message):
     """Показывает статистику по лотам"""
     lots = get_cached_lots() or get_lots_from_profile()
     if not lots:
-        cardinal.send_message(message.chat.id, "❌ Нет данных. Нажмите 'Загрузить лоты'")
+        # 🔥 ИСПРАВЛЕНО: используем bot
+        bot.send_message(message.chat.id, "❌ Нет данных. Нажмите 'Загрузить лоты'")
         return
     
     total = len(lots)
@@ -423,7 +442,8 @@ def show_stats(message):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:0:all"))
     
-    cardinal.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+    # 🔥 ИСПРАВЛЕНО: используем bot
+    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
 
 # ============================================
 # 🔄 ОБРАБОТЧИКИ
