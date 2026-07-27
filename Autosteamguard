@@ -1,26 +1,23 @@
 """
-Lot Manager v2.3 — Управление лотами FunPay
-Адаптировано из MASSedit
+Bad Review Refund — Автоматический возврат при плохом отзыве
+Делает возврат денег при получении негативного отзыва (ДАЖЕ ПРИ 5 ЗВЁЗДАХ)
 """
 import uuid as uuid_lib
 import json
 import os
 import re
 import time
-import threading
 from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from tg_bot.utils import escape
 
-NAME = "Lot Manager"
-VERSION = "2.3.0"
-DESCRIPTION = "Управление лотами FunPay"
+NAME = "Bad Review Refund"
+VERSION = "1.0.0"
+DESCRIPTION = "Автоматический возврат при плохом отзыве"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
 
-CONFIG_PATH = "storage/cache/lot_manager.json"
-LOTS_CACHE_PATH = "storage/cache/lots_cache.json"
+CONFIG_PATH = "storage/cache/bad_review_refund.json"
 
 cardinal = None
 tg = None
@@ -28,41 +25,27 @@ bot = None
 
 # 🔥 НАСТРОЙКИ
 DEFAULT_SETTINGS = {
-    "auto_update": True,
-    "update_interval": 120,
-    "lots_cache": [],
+    "active": True,
+    "refund_enabled": True,
+    "check_by_stars": False,
+    "bad_words": [
+        "говно", "хуйня", "херня", "фигня", "дерьмо", "мусор",
+        "плохо", "ужасно", "отвратительно", "кошмар", "беда",
+        "не работает", "не пришло", "не получил", "обман", "лохотрон",
+        "кидала", "кинул", "обманул", "скам", "мошенник", "развод",
+        "зря", "жаль", "расстроен", "разочарован",
+        "ужас", "бардак", "хам", "грубо", "неадекват",
+        "долго", "тупит", "глючит", "лагает",
+        "0 звезд", "0 звёзд", "1 звезда", "1 звёзд", "плохой",
+        "5 звезд", "5 звёзд", "пять звезд", "пять звёзд", "отлично"
+    ],
+    "min_stars": 0,
+    "refund_message": "✅ Возврат выполнен. Извините за неудобства!",
+    "admin_notify": True,
 }
 
 SETTINGS = DEFAULT_SETTINGS.copy()
-
-PER_PAGE = 5
-
-# 🔥 КНОПКИ
-CBT_LOT_LIST = "LotManager_List"
-CBT_LOT_EDIT = "LotManager_Edit"
-CBT_LOT_PRICE = "LotManager_Price"
-CBT_LOT_COUNT = "LotManager_Count"
-CBT_LOT_STATUS = "LotManager_Status"
-CBT_LOT_DESC = "LotManager_Desc"
-CBT_LOT_SHORT = "LotManager_Short"
-CBT_LOT_DELETE = "LotManager_Delete"
-CBT_LOT_DELETE_CONFIRM = "LotManager_DeleteConfirm"
-CBT_LOT_DELETE_CANCEL = "LotManager_DeleteCancel"
-CBT_LOT_REFRESH = "LotManager_Refresh"
-CBT_LOT_BACK = "LotManager_Back"
-CBT_LOT_PAGE = "LotManager_Page"
-CBT_LOT_LOAD = "LotManager_Load"
-CBT_LOT_FILTER = "LotManager_Filter"
-CBT_LOT_UPDATE = "LotManager_Update"
-CBT_LOT_RELOAD = "LotManager_Reload"
-CBT_LOT_LOT = "LotManager_Lot"
-
-# Состояния ожидания ввода
-WAITING_PRICE = "waiting_price"
-WAITING_COUNT = "waiting_count"
-WAITING_DESC = "waiting_desc"
-WAITING_SHORT = "waiting_short"
-WAITING_FIELD = "waiting_field"
+processed_orders = {}
 
 # ============================================
 # 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
@@ -80,7 +63,7 @@ def load_config():
         else:
             save_config()
     except Exception as e:
-        print(f"[LM] ❌ Ошибка загрузки конфига: {e}")
+        print(f"[BRR] ❌ Ошибка загрузки конфига: {e}")
         save_config()
 
 def save_config():
@@ -89,481 +72,246 @@ def save_config():
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        print(f"[LM] ❌ Ошибка сохранения: {e}")
+        print(f"[BRR] ❌ Ошибка сохранения: {e}")
 
-def load_cache():
-    """Загружает кэш лотов"""
-    try:
-        if os.path.exists(LOTS_CACHE_PATH):
-            with open(LOTS_CACHE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"[LM] ❌ Ошибка загрузки кэша: {e}")
-    return []
-
-def save_cache(data):
-    """Сохраняет кэш лотов"""
-    try:
-        os.makedirs(os.path.dirname(LOTS_CACHE_PATH), exist_ok=True)
-        with open(LOTS_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        print(f"[LM] ✅ Сохранено {len(data)} лотов в кэш")
-    except Exception as e:
-        print(f"[LM] ❌ Ошибка сохранения кэша: {e}")
-
-def escape_markdown(text):
+def check_bad_review(text):
+    """Проверяет текст на наличие негативных слов"""
     if not text:
-        return ""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
+        return False
+    
+    text_lower = text.lower()
+    
+    for word in SETTINGS.get("bad_words", []):
+        if word.lower() in text_lower:
+            return True
+        
+        word_no_spaces = word.replace(" ", "")
+        if word_no_spaces and word_no_spaces in text_lower.replace(" ", ""):
+            return True
+    
+    return False
 
-# ============================================
-# 🔥 ЗАГРУЗКА ЛОТОВ (КАК В MASSedit)
-# ============================================
-
-def reload_lots():
-    """Скачивает лоты из FunPay (как в MASSedit)"""
+def refund_order(chat_id, order_id, review_text, review_stars):
+    """Делает возврат по заказу с подробным логированием"""
+    print(f"[BRR] 🔄 Начинаю возврат по заказу {order_id}")
+    
     try:
-        print("[LM] 🔄 Скачивание лотов из FunPay...")
+        # 🔥 ПРОВЕРЯЕМ ПОЛУЧЕНИЕ ЗАКАЗА
+        print(f"[BRR] 📦 Получаю заказ {order_id}...")
+        order = cardinal.account.get_order(order_id)
         
-        if not cardinal.account:
-            print("[LM] ❌ Аккаунт не авторизован")
-            return []
+        if not order:
+            print(f"[BRR] ❌ Заказ {order_id} НЕ НАЙДЕН!")
+            return False
         
-        cache = []
-        subcats = []
+        print(f"[BRR] ✅ Заказ найден: {order}")
         
-        # 🔥 Собираем ВСЕ подкатегории с лотами
-        try:
-            categories = cardinal.account.categories
-            if not categories:
-                print("[LM] ❌ Не удалось получить категории")
-                return []
-            
-            for cat in categories:
-                try:
-                    subcats_list = cat.get_subcategories()
-                    for sub in subcats_list:
-                        # Только COMMON (обычные лоты)
-                        if hasattr(sub, 'type') and sub.type.value == 0:
-                            subcats.append(sub)
-                        elif not hasattr(sub, 'type'):
-                            subcats.append(sub)
-                except Exception as e:
-                    print(f"[LM] ⚠️ Ошибка категории {cat}: {e}")
-        except Exception as e:
-            print(f"[LM] ⚠️ Ошибка получения категорий: {e}")
-            # Пробуем альтернативный способ
-            try:
-                subcats = cardinal.account.get_subcategories()
-            except:
-                pass
+        # 🔥 ПРОВЕРЯЕМ ВОЗМОЖНОСТЬ ВОЗВРАТА
+        print(f"[BRR] 🔍 Проверяю возможность возврата...")
         
-        print(f"[LM] 📂 Найдено {len(subcats)} подкатегорий")
+        if not hasattr(order, 'can_refund'):
+            print(f"[BRR] ❌ У заказа нет метода can_refund()")
+            return False
         
-        # 🔥 Запрашиваем лоты в каждой подкатегории
-        for idx, sub in enumerate(subcats):
-            try:
-                sub_id = sub.id if hasattr(sub, 'id') else str(sub)
-                sub_name = sub.ui_name if hasattr(sub, 'ui_name') else str(sub)
-                
-                sub_lots = cardinal.account.get_my_subcategory_lots(sub_id)
-                if sub_lots:
-                    for lot in sub_lots:
-                        cache.append({
-                            "offer_id": str(lot.id),
-                            "name": lot.description or "?",
-                            "price": str(lot.price or 0),
-                            "amount": str(lot.amount or 0),
-                            "active": "on" if lot.active else "",
-                            "type": "?",
-                            "node_id": str(sub_id),
-                            "subcategory": sub_name
-                        })
-                
-                # Прогресс каждые 10 категорий
-                if idx % 10 == 0:
-                    print(f"[LM] 🔍 Обработано {idx+1}/{len(subcats)}, найдено {len(cache)} лотов")
-                    
-            except Exception as e:
-                print(f"[LM] ⚠️ Ошибка подкатегории {idx}: {e}")
-                continue
+        if not order.can_refund():
+            print(f"[BRR] ❌ Возврат по заказу {order_id} НЕВОЗМОЖЕН!")
+            print(f"[BRR] 💡 Возможно: заказ уже завершен или прошло слишком много времени")
+            return False
         
-        # 🔥 Дозаполняем типы для первых 50 лотов
-        print("[LM] 📝 Заполнение типов лотов...")
-        for idx, lot in enumerate(cache[:50]):
-            try:
-                time.sleep(0.15)
-                fields = cardinal.account.get_lot_fields(lot["offer_id"])
-                if fields and hasattr(fields, 'fields'):
-                    lot["type"] = fields.fields.get("fields[type]", "?")
-                else:
-                    lot["type"] = "?"
-            except Exception as e:
-                lot["type"] = "?"
+        print(f"[BRR] ✅ Возврат возможен")
         
-        if cache:
-            save_cache(cache)
-            SETTINGS["lots_cache"] = cache
-            save_config()
-            print(f"[LM] ✅ Загружено {len(cache)} лотов")
-        else:
-            print("[LM] ❌ Лотов не найдено")
+        # 🔥 ДЕЛАЕМ ВОЗВРАТ
+        print(f"[BRR] 💰 Выполняю возврат...")
         
-        return cache
+        if not hasattr(order, 'refund'):
+            print(f"[BRR] ❌ У заказа нет метода refund()")
+            return False
+        
+        order.refund()
+        
+        print(f"[BRR] ✅ Возврат по заказу {order_id} ВЫПОЛНЕН!")
+        
+        # 🔥 ОТПРАВЛЯЕМ СООБЩЕНИЕ
+        refund_msg = SETTINGS.get("refund_message", "✅ Возврат выполнен. Извините за неудобства!")
+        cardinal.send_message(chat_id, refund_msg)
+        print(f"[BRR] 📤 Отправлено сообщение покупателю: {refund_msg}")
+        
+        # 🔥 УВЕДОМЛЕНИЕ АДМИНУ
+        if SETTINGS.get("admin_notify", True):
+            admin_msg = (
+                f"💰 **Возврат выполнен!**\n\n"
+                f"🆔 Заказ: {order_id}\n"
+                f"💬 Отзыв: {review_text[:100]}...\n"
+                f"⭐ Оценка: {review_stars} звезд\n"
+                f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+            )
+            admin_id = SETTINGS.get("admin_chat_id")
+            if admin_id:
+                cardinal.send_message(admin_id, admin_msg)
+                print(f"[BRR] 📤 Отправлено уведомление админу")
+        
+        return True
         
     except Exception as e:
-        print(f"[LM] ❌ Сбой загрузки: {e}")
+        print(f"[BRR] ❌ ОШИБКА возврата по заказу {order_id}: {e}")
         import traceback
         traceback.print_exc()
-        return []
-
-def get_lots_from_profile():
-    """Возвращает лоты из кэша или загружает новые"""
-    lots = load_cache()
-    if not lots:
-        lots = reload_lots()
-    return lots
+        return False
 
 # ============================================
-# 🔧 ФУНКЦИИ ПОЛУЧЕНИЯ ДАННЫХ ЛОТА
+# 🔄 ОБРАБОТЧИК ОТЗЫВОВ
 # ============================================
 
-def get_lot_name(lot):
-    return lot.get("name", "Без названия")
-
-def get_lot_price(lot):
-    return lot.get("price", "0")
-
-def get_lot_amount(lot):
-    return lot.get("amount", "0")
-
-def get_lot_active(lot):
-    return lot.get("active") == "on"
-
-def get_lot_type(lot):
-    return lot.get("type", "?")
-
-def get_lot_node(lot):
-    return lot.get("node_id", "?")
-
-def get_lot_offer_id(lot):
-    return lot.get("offer_id", "")
-
-def get_lot_subcategory(lot):
-    return lot.get("subcategory", "Без категории")
+def review_handler(e):
+    """Обрабатывает новые отзывы и делает возврат"""
+    
+    print(f"[BRR] 🔔 Получено событие: {type(e)}")
+    
+    if not SETTINGS.get("active", True):
+        print(f"[BRR] ⏸️ Плагин отключен")
+        return
+    
+    if not SETTINGS.get("refund_enabled", True):
+        print(f"[BRR] ⏸️ Возвраты отключены")
+        return
+    
+    try:
+        # 🔥 ПОЛУЧАЕМ ДАННЫЕ ОТЗЫВА
+        review = None
+        
+        if hasattr(e, 'review'):
+            review = e.review
+            print(f"[BRR] 📝 Отзыв из e.review")
+        elif hasattr(e, 'message') and hasattr(e.message, 'review'):
+            review = e.message.review
+            print(f"[BRR] 📝 Отзыв из e.message.review")
+        else:
+            print(f"[BRR] ⚠️ Не удалось получить отзыв из события")
+            return
+        
+        if not review:
+            print(f"[BRR] ⚠️ Отзыв пустой")
+            return
+        
+        # 🔥 ИЗВЛЕКАЕМ ДАННЫЕ
+        review_text = review.text if hasattr(review, 'text') else str(review)
+        review_stars = review.stars if hasattr(review, 'stars') else 0
+        order_id = review.order_id if hasattr(review, 'order_id') else None
+        chat_id = e.chat_id if hasattr(e, 'chat_id') else e.chat.id
+        
+        print(f"[BRR] 📋 Данные отзыва:")
+        print(f"[BRR]    Текст: {review_text[:50]}...")
+        print(f"[BRR]    Звёзды: {review_stars}")
+        print(f"[BRR]    Заказ: {order_id}")
+        print(f"[BRR]    Чат: {chat_id}")
+        
+        # 🔥 ПРОВЕРЯЕМ ПЛОХОЙ ЛИ ОТЗЫВ
+        is_bad = False
+        reason = []
+        
+        if SETTINGS.get("check_by_stars", False):
+            min_stars = SETTINGS.get("min_stars", 0)
+            if review_stars <= min_stars:
+                is_bad = True
+                reason.append(f"звёзды ({review_stars})")
+                print(f"[BRR] ⭐ Проверка по звёздам: {review_stars} <= {min_stars} -> ДА")
+            else:
+                print(f"[BRR] ⭐ Проверка по звёздам: {review_stars} <= {min_stars} -> НЕТ")
+        else:
+            if review_text and check_bad_review(review_text):
+                is_bad = True
+                reason.append("текст")
+                print(f"[BRR] 📝 Проверка по тексту: найдены плохие слова -> ДА")
+            else:
+                print(f"[BRR] 📝 Проверка по тексту: плохих слов нет -> НЕТ")
+        
+        if not is_bad:
+            print(f"[BRR] ✅ Отзыв не является плохим, возврат не требуется")
+            return
+        
+        print(f"[BRR] ⚠️ Обнаружен ПЛОХОЙ отзыв! Причина: {', '.join(reason)}")
+        
+        # 🔥 ПРОВЕРЯЕМ НЕ ОБРАБАТЫВАЛИ ЛИ УЖЕ
+        if order_id and order_id in processed_orders:
+            elapsed = time.time() - processed_orders[order_id]
+            if elapsed < 3600:
+                print(f"[BRR] ⏸️ Заказ {order_id} уже обработан {int(elapsed)}с назад, пропускаем")
+                return
+        
+        if order_id:
+            processed_orders[order_id] = time.time()
+            print(f"[BRR] 📝 Заказ {order_id} добавлен в историю")
+        
+        # 🔥 ДЕЛАЕМ ВОЗВРАТ
+        if order_id:
+            print(f"[BRR] 🔄 Запуск возврата по заказу {order_id}...")
+            refund_order(chat_id, order_id, review_text, review_stars)
+        else:
+            print(f"[BRR] ❌ ID заказа НЕ НАЙДЕН в отзыве!")
+        
+        # 🔥 ОЧИЩАЕМ СТАРЫЕ ЗАПИСИ
+        now = time.time()
+        for oid in list(processed_orders.keys()):
+            if now - processed_orders[oid] > 86400:
+                del processed_orders[oid]
+        
+    except Exception as e:
+        print(f"[BRR] ❌ ОШИБКА обработки отзыва: {e}")
+        import traceback
+        traceback.print_exc()
 
 # ============================================
 # 📱 ИНТЕРФЕЙС
 # ============================================
 
-def show_lots_menu(message, page=0, filter_type="all"):
-    """Показывает список лотов (как в MASSedit)"""
-    
-    lots = load_cache()
-    
-    if not lots:
-        loading_msg = bot.send_message(message.chat.id, "🔄 Скачиваю лоты...")
-        lots = reload_lots()
-        if not lots:
-            bot.edit_message_text("❌ Лотов не найдено", message.chat.id, loading_msg.id)
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔄 Скачать", callback_data=f"{CBT_LOT_RELOAD}"))
-            kb.add(InlineKeyboardButton("📝 Создать лот на FunPay", url="https://funpay.com/sell/"))
-            bot.send_message(
-                message.chat.id,
-                "❌ Лотов не найдено.\n\n"
-                "💡 Проверь:\n"
-                "1. Есть ли у тебя созданные лоты на FunPay\n"
-                "2. Правильный ли golden_key в Cardinal\n"
-                "3. Сессия FunPay активна",
-                reply_markup=kb
-            )
-            return
-        bot.delete_message(message.chat.id, loading_msg.id)
-    
-    # Фильтрация
-    if filter_type == "active":
-        filtered = [l for l in lots if get_lot_active(l)]
-    elif filter_type == "inactive":
-        filtered = [l for l in lots if not get_lot_active(l)]
-    else:
-        filtered = lots
-    
-    # Сортировка: активные сверху
-    sorted_lots = sorted(filtered, key=lambda l: (not get_lot_active(l), get_lot_name(l)))
-    
-    total = len(sorted_lots)
-    total_pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
-    if page >= total_pages:
-        page = total_pages - 1
-    if page < 0:
-        page = 0
-    
-    start = page * PER_PAGE
-    end = min(start + PER_PAGE, total)
-    page_lots = sorted_lots[start:end]
-    
-    total_active = len([l for l in lots if get_lot_active(l)])
-    total_inactive = len([l for l in lots if not get_lot_active(l)])
-    
-    filter_names = {
-        "all": "Все",
-        "active": "🟢 Активные",
-        "inactive": "🔴 Неактивные"
-    }
-    
-    text = f"📋 **Список лотов**\n"
-    text += f"📂 {filter_names.get(filter_type, 'Все')} | стр. {page + 1}/{total_pages}\n"
-    text += f"📊 Всего: {total} | 🟢 Активных: {total_active} | 🔴 Неактивных: {total_inactive}\n\n"
-    
-    if not page_lots:
-        text += "❌ Нет лотов в этой категории\n"
-    else:
-        for i, lot in enumerate(page_lots, 1):
-            idx = start + i
-            name = escape_markdown(get_lot_name(lot)[:35])
-            status = "✅" if get_lot_active(lot) else "❌"
-            price = get_lot_price(lot)
-            amount = get_lot_amount(lot)
-            lot_type = get_lot_type(lot)
-            node = get_lot_node(lot)
-            
-            text += f"{idx}. {status} [{lot_type}] #{node}\n"
-            text += f"   `{name}`\n"
-            text += f"   💵 {price}₽ | 📦 {amount} шт.\n\n"
-    
+def show_menu(message):
     kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('active', True) else '🔴'} Плагин: {'ВКЛ' if SETTINGS.get('active', True) else 'ВЫКЛ'}",
+        callback_data="brr_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('refund_enabled', True) else '🔴'} Возвраты: {'ВКЛ' if SETTINGS.get('refund_enabled', True) else 'ВЫКЛ'}",
+        callback_data="brr_refund_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'⭐' if SETTINGS.get('check_by_stars', False) else '📝'} Проверка: {'По звёздам' if SETTINGS.get('check_by_stars', False) else 'По тексту'}",
+        callback_data="brr_check_mode"
+    ))
+    kb.add(InlineKeyboardButton("✏️ Сменить текст возврата", callback_data="brr_edit_text"))
+    kb.add(InlineKeyboardButton("📝 Список плохих слов", callback_data="brr_show_words"))
+    kb.add(InlineKeyboardButton("➕ Добавить слово", callback_data="brr_add_word"))
+    kb.add(InlineKeyboardButton("🗑️ Очистить историю", callback_data="brr_clear_history"))
+    kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="brr_refresh"))
     
-    # 🔥 Кнопки с названиями лотов
-    for i, lot in enumerate(page_lots):
-        idx = start + i
-        name = escape_markdown(get_lot_name(lot)[:30])
-        price = get_lot_price(lot)
-        kb.add(InlineKeyboardButton(
-            f"📝 `{name}` | {price}₽",
-            callback_data=f"{CBT_LOT_LOT}_{idx}"
-        ))
+    check_mode = "По звёздам" if SETTINGS.get("check_by_stars", False) else "По тексту (звёзды НЕ важны)"
     
-    # Навигация
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"{CBT_LOT_PAGE}:{page - 1}:{filter_type}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"{CBT_LOT_PAGE}:{page + 1}:{filter_type}"))
-    if nav:
-        kb.row(*nav)
-    
-    # Кнопки фильтрации
-    kb.row(
-        InlineKeyboardButton("📂 Все", callback_data=f"{CBT_LOT_FILTER}:all:0"),
-        InlineKeyboardButton("🟢 Активные", callback_data=f"{CBT_LOT_FILTER}:active:0"),
-        InlineKeyboardButton("🔴 Неактивные", callback_data=f"{CBT_LOT_FILTER}:inactive:0")
+    text = (
+        f"💰 **Bad Review Refund v{VERSION}**\n\n"
+        f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
+        f"📌 **Возвраты:** {'🟢 Включены' if SETTINGS.get('refund_enabled', True) else '🔴 Отключены'}\n"
+        f"🔍 **Режим проверки:** {check_mode}\n"
+        f"📝 **Плохих слов:** {len(SETTINGS.get('bad_words', []))}\n"
+        f"🔄 **Обработано заказов:** {len(processed_orders)}\n\n"
+        f"💬 **Текст возврата:**\n{SETTINGS.get('refund_message', '')[:100]}..."
     )
     
-    # Общие кнопки
-    kb.row(
-        InlineKeyboardButton("🔄 Скачать", callback_data=f"{CBT_LOT_RELOAD}"),
-        InlineKeyboardButton("📊 Статистика", callback_data="LotManager_Stats")
-    )
-    
-    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+    bot.send_message(message.chat.id, text, reply_markup=kb)
 
-def show_lot_card(call, lot_index):
-    """Показывает карточку лота"""
-    lots = load_cache()
-    if not lots or lot_index >= len(lots):
-        bot.answer_callback_query(call.id, "❌ Лот не найден")
-        return
+def show_words(message):
+    words = SETTINGS.get("bad_words", [])
     
-    lot = lots[lot_index]
-    
-    name = escape_markdown(get_lot_name(lot))
-    price = get_lot_price(lot)
-    amount = get_lot_amount(lot)
-    active = "🟢 Активен" if get_lot_active(lot) else "🔴 Неактивен"
-    lot_type = get_lot_type(lot)
-    node = get_lot_node(lot)
-    offer_id = get_lot_offer_id(lot)
-    subcategory = escape_markdown(get_lot_subcategory(lot))
-    
-    text = f"📝 **Карточка лота**\n\n"
-    text += f"• Название: `{name[:50]}`\n"
-    text += f"• Цена: `{price}` ₽\n"
-    text += f"• Количество: `{amount}` шт.\n"
-    text += f"• Статус: {active}\n"
-    text += f"• Тип: {lot_type}\n"
-    text += f"• node_id: `{node}`\n"
-    text += f"• ID: `{offer_id}`\n"
-    text += f"• Категория: {subcategory}\n"
-    
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(
-        InlineKeyboardButton("💰 Цена", callback_data=f"{CBT_LOT_PRICE}:{lot_index}"),
-        InlineKeyboardButton("📦 Кол-во", callback_data=f"{CBT_LOT_COUNT}:{lot_index}")
-    )
-    kb.row(
-        InlineKeyboardButton("📝 Описание", callback_data=f"{CBT_LOT_DESC}:{lot_index}"),
-        InlineKeyboardButton("🔄 Статус", callback_data=f"{CBT_LOT_STATUS}:{lot_index}")
-    )
-    kb.row(
-        InlineKeyboardButton("🗑️ Удалить", callback_data=f"{CBT_LOT_DELETE}:{lot_index}"),
-        InlineKeyboardButton("◀️ Назад", callback_data=f"{CBT_LOT_BACK}:0:all")
-    )
-    
-    bot.edit_message_text(text, call.message.chat.id, call.message.id, reply_markup=kb, parse_mode="Markdown")
-    bot.answer_callback_query(call.id)
-
-# ============================================
-# 🔄 ОБРАБОТЧИКИ
-# ============================================
-
-def handle_input(message):
-    state = tg.get_state(message.chat.id, message.from_user.id)
-    if not state:
-        return
-    
-    action = state["action"]
-    data = state["data"]
-    lot_index = data.get("lot_index", 0)
-    field = data.get("field", "")
-    
-    try:
-        if action == WAITING_PRICE:
-            price = int(message.text.strip())
-            lots = load_cache()
-            if lots and lot_index < len(lots):
-                lot = lots[lot_index]
-                offer_id = get_lot_offer_id(lot)
-                
-                # Обновляем через API
-                fields = cardinal.account.get_lot_fields(offer_id)
-                if fields:
-                    fields.price = float(price)
-                    fields.renew_fields()
-                    cardinal.account.save_lot(fields)
-                    
-                    # Обновляем кэш
-                    lot["price"] = str(price)
-                    save_cache(lots)
-                    bot.reply_to(message, f"✅ Цена обновлена: {price}₽")
-                else:
-                    bot.reply_to(message, "❌ Не удалось получить поля лота")
-            show_lots_menu(message)
-        
-        elif action == WAITING_COUNT:
-            count = int(message.text.strip())
-            lots = load_cache()
-            if lots and lot_index < len(lots):
-                lot = lots[lot_index]
-                offer_id = get_lot_offer_id(lot)
-                
-                fields = cardinal.account.get_lot_fields(offer_id)
-                if fields:
-                    fields.amount = count
-                    fields.renew_fields()
-                    cardinal.account.save_lot(fields)
-                    
-                    lot["amount"] = str(count)
-                    save_cache(lots)
-                    bot.reply_to(message, f"✅ Количество обновлено: {count}")
-                else:
-                    bot.reply_to(message, "❌ Не удалось получить поля лота")
-            show_lots_menu(message)
-        
-        elif action == WAITING_DESC:
-            desc = message.text.strip()
-            lots = load_cache()
-            if lots and lot_index < len(lots):
-                lot = lots[lot_index]
-                offer_id = get_lot_offer_id(lot)
-                
-                fields = cardinal.account.get_lot_fields(offer_id)
-                if fields:
-                    fields.description = desc
-                    fields.renew_fields()
-                    cardinal.account.save_lot(fields)
-                    
-                    lot["name"] = desc
-                    save_cache(lots)
-                    bot.reply_to(message, "✅ Описание обновлено")
-                else:
-                    bot.reply_to(message, "❌ Не удалось получить поля лота")
-            show_lots_menu(message)
-    
-    except ValueError:
-        bot.reply_to(message, "❌ Введите число!")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-    
-    tg.clear_state(message.chat.id, message.from_user.id)
-
-def handle_lot_action(call, action, lot_index):
-    lots = load_cache()
-    if not lots or lot_index >= len(lots):
-        bot.answer_callback_query(call.id, "❌ Лот не найден")
-        return
-    
-    lot = lots[lot_index]
-    offer_id = get_lot_offer_id(lot)
-    
-    if action == "status":
-        try:
-            new_status = not get_lot_active(lot)
-            
-            fields = cardinal.account.get_lot_fields(offer_id)
-            if fields:
-                fields.active = new_status
-                fields.renew_fields()
-                cardinal.account.save_lot(fields)
-                
-                lot["active"] = "on" if new_status else ""
-                save_cache(lots)
-                
-                status_text = "активирован" if new_status else "деактивирован"
-                bot.answer_callback_query(call.id, f"✅ Лот {status_text}")
-            else:
-                bot.answer_callback_query(call.id, "❌ Не удалось получить поля лота")
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
-        show_lots_menu(call.message)
-    
-    elif action == "delete":
-        try:
-            cardinal.account.delete_lot(offer_id)
-            lots.pop(lot_index)
-            save_cache(lots)
-            bot.answer_callback_query(call.id, "🗑️ Лот удален!")
-            show_lots_menu(call.message)
-        except Exception as e:
-            bot.answer_callback_query(call.id, f"❌ Ошибка удаления: {e}")
-
-def show_stats(message):
-    lots = load_cache()
-    if not lots:
-        bot.send_message(message.chat.id, "❌ Нет данных. Нажмите 'Скачать'")
-        return
-    
-    total = len(lots)
-    active = len([l for l in lots if get_lot_active(l)])
-    inactive = len([l for l in lots if not get_lot_active(l)])
-    
-    total_price = sum(int(get_lot_price(l)) for l in lots)
-    total_count = sum(int(get_lot_amount(l)) for l in lots)
-    avg_price = total_price // total if total > 0 else 0
-    
-    text = f"📊 **Статистика лотов**\n\n"
-    text += f"📌 **Всего лотов:** {total}\n"
-    text += f"🟢 **Активных:** {active}\n"
-    text += f"🔴 **Неактивных:** {inactive}\n"
-    text += f"💰 **Общая стоимость:** {total_price}₽\n"
-    text += f"💰 **Средняя цена:** {avg_price}₽\n"
-    text += f"📦 **Общее количество:** {total_count}\n"
+    if not words:
+        text = "📝 Список плохих слов пуст"
+    else:
+        text = "📝 **Список плохих слов:**\n\n"
+        for i, word in enumerate(words, 1):
+            text += f"{i}. `{word}`\n"
     
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("◀️ Назад к списку", callback_data=f"{CBT_LOT_BACK}:0:all"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="brr_menu"))
     
-    bot.send_message(message.chat.id, text, reply_markup=kb, parse_mode="Markdown")
+    bot.send_message(message.chat.id, text, reply_markup=kb)
 
 # ============================================
 # 🚀 ИНИЦИАЛИЗАЦИЯ
@@ -576,118 +324,105 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[LM] 📦 ЗАГРУЗКА Lot Manager v2.3")
-    print("[LM] 🔥 Адаптировано из MASSedit")
+    print("[BRR] 💰 ЗАГРУЗКА Bad Review Refund v1.0")
+    print("[BRR] 🔄 Автоматический возврат при плохих отзывах")
+    print("[BRR] 🔥 Возврат ДАЖЕ при 5 звёздах (есть плохие слова)")
     print("=" * 50)
     
     load_config()
     
-    c.add_telegram_commands(UUID, [
-        ("lots", "📦 Управление лотами", True),
-        ("lot_stats", "📊 Статистика лотов", True),
-        ("lot_load", "📥 Загрузить лоты", True)
-    ])
+    c.add_telegram_commands(UUID, [("brr", "💰 Возврат по отзывам", True)])
+    tg.msg_handler(show_menu, commands=["brr"])
     
-    tg.msg_handler(lambda m: show_lots_menu(m), commands=["lots"])
-    tg.msg_handler(lambda m: show_stats(m), commands=["lot_stats"])
-    tg.msg_handler(lambda m: show_lots_menu(m), commands=["lot_load"])
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_toggle")
+    def toggle(call):
+        SETTINGS["active"] = not SETTINGS.get("active", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_refund_toggle")
+    def refund_toggle(call):
+        SETTINGS["refund_enabled"] = not SETTINGS.get("refund_enabled", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['refund_enabled'] else 'OFF'}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_check_mode")
+    def check_mode(call):
+        SETTINGS["check_by_stars"] = not SETTINGS.get("check_by_stars", False)
+        save_config()
+        mode = "по звёздам" if SETTINGS["check_by_stars"] else "по тексту (звёзды НЕ важны)"
+        bot.answer_callback_query(call.id, f"Режим: {mode}")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_edit_text")
+    def edit_text(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "💬 Введите новый текст для сообщения о возврате:")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, "brr_edit_text")
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_show_words")
+    def show_words_cb(call):
+        bot.answer_callback_query(call.id)
+        show_words(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_add_word")
+    def add_word(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "➕ Введите слово для добавления:")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, "brr_add_word")
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_clear_history")
+    def clear_history(call):
+        processed_orders.clear()
+        bot.answer_callback_query(call.id, "🗑️ История очищена")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_refresh")
+    def refresh(call):
+        bot.answer_callback_query(call.id, "🔄 Обновлено")
+        show_menu(call.message)
+    
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_menu")
+    def menu(call):
+        bot.answer_callback_query(call.id)
+        show_menu(call.message)
+    
+    def handle_input(message):
+        state = tg.get_state(message.chat.id, message.from_user.id)
+        if not state:
+            return
+        
+        action = state.get("action")
+        
+        if action == "brr_edit_text":
+            SETTINGS["refund_message"] = message.text.strip()
+            save_config()
+            bot.reply_to(message, "✅ Текст возврата обновлён!")
+            show_menu(message)
+        
+        elif action == "brr_add_word":
+            word = message.text.strip().lower()
+            if word:
+                if word not in SETTINGS["bad_words"]:
+                    SETTINGS["bad_words"].append(word)
+                    save_config()
+                    bot.reply_to(message, f"✅ Слово `{word}` добавлено!")
+                else:
+                    bot.reply_to(message, f"⚠️ Слово `{word}` уже есть в списке")
+            show_menu(message)
+        
+        tg.clear_state(message.chat.id, message.from_user.id)
+    
     tg.msg_handler(handle_input, func=lambda m: tg.check_state(m.chat.id, m.from_user.id))
     
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_LIST))
-    def handle_list(call):
-        show_lots_menu(call.message)
-        bot.answer_callback_query(call.id)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_LOT))
-    def handle_lot(call):
-        lot_index = int(call.data.split("_")[1])
-        show_lot_card(call, lot_index)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_PRICE))
-    def handle_price(call):
-        lot_index = int(call.data.split(":")[1])
-        bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "💰 Введите новую цену для лота:")
-        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_PRICE, {"lot_index": lot_index})
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_COUNT))
-    def handle_count(call):
-        lot_index = int(call.data.split(":")[1])
-        bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "📦 Введите новое количество для лота:")
-        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_COUNT, {"lot_index": lot_index})
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_STATUS))
-    def handle_status(call):
-        lot_index = int(call.data.split(":")[1])
-        handle_lot_action(call, "status", lot_index)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_DESC))
-    def handle_desc(call):
-        lot_index = int(call.data.split(":")[1])
-        bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "📝 Введите новое описание для лота:")
-        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, WAITING_DESC, {"lot_index": lot_index})
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_DELETE))
-    def handle_delete(call):
-        lot_index = int(call.data.split(":")[1])
-        handle_lot_action(call, "delete", lot_index)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_BACK))
-    def handle_back(call):
-        parts = call.data.split(":")
-        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
-        show_lots_menu(call.message, int(page), filter_type)
-        bot.answer_callback_query(call.id)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_PAGE))
-    def handle_page(call):
-        parts = call.data.split(":")
-        page, filter_type = parts[1], parts[2] if len(parts) > 2 else "all"
-        show_lots_menu(call.message, int(page), filter_type)
-        bot.answer_callback_query(call.id)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_FILTER))
-    def handle_filter(call):
-        parts = call.data.split(":")
-        filter_type, page = parts[1], parts[2]
-        show_lots_menu(call.message, int(page), filter_type)
-        bot.answer_callback_query(call.id)
-    
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(CBT_LOT_RELOAD))
-    def handle_reload(call):
-        bot.answer_callback_query(call.id, "🔄 Скачиваю лоты...")
-        msg = bot.send_message(call.message.chat.id, "🔄 Скачиваю лоты...")
-        lots = reload_lots()
-        if lots:
-            bot.edit_message_text(f"✅ Загружено {len(lots)} лотов", call.message.chat.id, msg.message_id)
-        else:
-            bot.edit_message_text("❌ Лотов не найдено", call.message.chat.id, msg.message_id)
-        show_lots_menu(call.message)
-    
-    @bot.callback_query_handler(func=lambda call: call.data == "LotManager_Stats")
-    def handle_stats(call):
-        show_stats(call.message)
-        bot.answer_callback_query(call.id)
-    
-    # Автообновление
-    if SETTINGS.get("auto_update", True):
-        def auto_updater():
-            time.sleep(10)
-            while True:
-                try:
-                    reload_lots()
-                    print(f"[LM] 🔄 Автообновление выполнено")
-                except Exception as e:
-                    print(f"[LM] ❌ Ошибка автообновления: {e}")
-                time.sleep(SETTINGS.get("update_interval", 120))
-        
-        threading.Thread(target=auto_updater, daemon=True).start()
-        print(f"[LM] 🔄 Автообновление: {SETTINGS.get('update_interval', 120)}с")
-    
-    print("[LM] ✅ Плагин загружен!")
-    print("[LM] 📌 Команды: /lots, /lot_stats, /lot_load")
+    print("=" * 50)
+    print("[BRR] ✅ ПЛАГИН ЗАГРУЖЕН!")
+    print("[BRR] 📌 /brr — меню настроек")
+    print("[BRR] 🔄 Автоматический возврат при плохих отзывах")
+    print("[BRR] 🔥 Возврат ДАЖЕ при 5 звёздах")
+    print("[BRR] 📋 СМОТРИ КОНСОЛЬ ДЛЯ ЛОГОВ")
     print("=" * 50)
 
 # ============================================
@@ -695,4 +430,6 @@ def init_plugin(c):
 # ============================================
 
 BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_NEW_MESSAGE = [review_handler]
+BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [review_handler]
 BIND_TO_DELETE = None
