@@ -1,6 +1,7 @@
 """
 Bad Review Refund — Автоматический возврат при плохом отзыве
-Делает возврат денег при получении негативного отзыва (ДАЖЕ ПРИ 5 ЗВЁЗДАХ)
+1-4 звезды → возврат только если сумма заказа <= 10₽
+5 звезд → возврат только при плохих словах и сумме <= 10₽
 """
 import uuid as uuid_lib
 import json
@@ -12,7 +13,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "Bad Review Refund"
 VERSION = "1.0.0"
-DESCRIPTION = "Автоматический возврат при плохом отзыве"
+DESCRIPTION = "Автоматический возврат при плохом отзыве (только до 10₽)"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
@@ -27,7 +28,7 @@ bot = None
 DEFAULT_SETTINGS = {
     "active": True,
     "refund_enabled": True,
-    "check_by_stars": False,
+    "max_refund_price": 10,  # 🔥 Максимальная сумма для возврата
     "bad_words": [
         "говно", "хуйня", "херня", "фигня", "дерьмо", "мусор",
         "плохо", "ужасно", "отвратительно", "кошмар", "беда",
@@ -37,9 +38,9 @@ DEFAULT_SETTINGS = {
         "ужас", "бардак", "хам", "грубо", "неадекват",
         "долго", "тупит", "глючит", "лагает",
         "0 звезд", "0 звёзд", "1 звезда", "1 звёзд", "плохой",
-        "5 звезд", "5 звёзд", "пять звезд", "пять звёзд", "отлично"
+        "5 звезд", "5 звёзд", "пять звезд", "пять звёзд", "отлично",
+        "нормально", "средне", "так себе", "негатив"
     ],
-    "min_stars": 0,
     "refund_message": "✅ Возврат выполнен. Извините за неудобства!",
     "admin_notify": True,
 }
@@ -91,12 +92,24 @@ def check_bad_review(text):
     
     return False
 
-def refund_order(chat_id, order_id, review_text, review_stars):
-    """Делает возврат по заказу с подробным логированием"""
+def get_order_price(order):
+    """Получает сумму заказа"""
+    try:
+        if hasattr(order, 'price'):
+            return float(order.price)
+        elif hasattr(order, 'amount'):
+            return float(order.amount)
+        else:
+            return 0
+    except:
+        return 0
+
+def refund_order(chat_id, order_id, review_text, review_stars, reason_text):
+    """Делает возврат по заказу"""
     print(f"[BRR] 🔄 Начинаю возврат по заказу {order_id}")
     
     try:
-        # 🔥 ПРОВЕРЯЕМ ПОЛУЧЕНИЕ ЗАКАЗА
+        # Получаем заказ
         print(f"[BRR] 📦 Получаю заказ {order_id}...")
         order = cardinal.account.get_order(order_id)
         
@@ -104,58 +117,59 @@ def refund_order(chat_id, order_id, review_text, review_stars):
             print(f"[BRR] ❌ Заказ {order_id} НЕ НАЙДЕН!")
             return False
         
-        print(f"[BRR] ✅ Заказ найден: {order}")
+        print(f"[BRR] ✅ Заказ найден")
         
-        # 🔥 ПРОВЕРЯЕМ ВОЗМОЖНОСТЬ ВОЗВРАТА
-        print(f"[BRR] 🔍 Проверяю возможность возврата...")
+        # 🔥 ПРОВЕРЯЕМ СУММУ ЗАКАЗА
+        order_price = get_order_price(order)
+        max_price = SETTINGS.get("max_refund_price", 10)
         
-        if not hasattr(order, 'can_refund'):
-            print(f"[BRR] ❌ У заказа нет метода can_refund()")
+        print(f"[BRR] 💰 Сумма заказа: {order_price}₽")
+        print(f"[BRR] 💰 Максимальная сумма для возврата: {max_price}₽")
+        
+        if order_price > max_price:
+            print(f"[BRR] ❌ Сумма заказа {order_price}₽ > {max_price}₽ → возврат НЕ ДЕЛАЕТСЯ")
+            cardinal.send_message(chat_id, f"ℹ️ Возврат не выполнен (сумма заказа {order_price}₽ превышает лимит {max_price}₽)")
             return False
         
-        if not order.can_refund():
+        print(f"[BRR] ✅ Сумма заказа {order_price}₽ <= {max_price}₽ → возврат разрешен")
+        
+        # Проверяем возможность возврата
+        if hasattr(order, 'can_refund') and not order.can_refund():
             print(f"[BRR] ❌ Возврат по заказу {order_id} НЕВОЗМОЖЕН!")
-            print(f"[BRR] 💡 Возможно: заказ уже завершен или прошло слишком много времени")
             return False
         
-        print(f"[BRR] ✅ Возврат возможен")
-        
-        # 🔥 ДЕЛАЕМ ВОЗВРАТ
+        # Делаем возврат
         print(f"[BRR] 💰 Выполняю возврат...")
         
-        if not hasattr(order, 'refund'):
-            print(f"[BRR] ❌ У заказа нет метода refund()")
-            return False
-        
-        order.refund()
+        if hasattr(order, 'refund'):
+            order.refund()
+        else:
+            cardinal.account.refund(order_id)
         
         print(f"[BRR] ✅ Возврат по заказу {order_id} ВЫПОЛНЕН!")
         
-        # 🔥 ОТПРАВЛЯЕМ СООБЩЕНИЕ
+        # Отправляем сообщение покупателю
         refund_msg = SETTINGS.get("refund_message", "✅ Возврат выполнен. Извините за неудобства!")
         cardinal.send_message(chat_id, refund_msg)
-        print(f"[BRR] 📤 Отправлено сообщение покупателю: {refund_msg}")
         
-        # 🔥 УВЕДОМЛЕНИЕ АДМИНУ
+        # Уведомление админу
         if SETTINGS.get("admin_notify", True):
             admin_msg = (
                 f"💰 **Возврат выполнен!**\n\n"
                 f"🆔 Заказ: {order_id}\n"
-                f"💬 Отзыв: {review_text[:100]}...\n"
                 f"⭐ Оценка: {review_stars} звезд\n"
+                f"💬 Причина: {reason_text}\n"
+                f"💰 Сумма: {order_price}₽\n"
                 f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
             )
             admin_id = SETTINGS.get("admin_chat_id")
             if admin_id:
                 cardinal.send_message(admin_id, admin_msg)
-                print(f"[BRR] 📤 Отправлено уведомление админу")
         
         return True
         
     except Exception as e:
         print(f"[BRR] ❌ ОШИБКА возврата по заказу {order_id}: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 # ============================================
@@ -165,7 +179,7 @@ def refund_order(chat_id, order_id, review_text, review_stars):
 def review_handler(e):
     """Обрабатывает новые отзывы и делает возврат"""
     
-    print(f"[BRR] 🔔 Получено событие: {type(e)}")
+    print(f"[BRR] 🔔 Получено событие отзыва")
     
     if not SETTINGS.get("active", True):
         print(f"[BRR] ⏸️ Плагин отключен")
@@ -176,80 +190,88 @@ def review_handler(e):
         return
     
     try:
-        # 🔥 ПОЛУЧАЕМ ДАННЫЕ ОТЗЫВА
-        review = None
-        
-        if hasattr(e, 'review'):
-            review = e.review
-            print(f"[BRR] 📝 Отзыв из e.review")
-        elif hasattr(e, 'message') and hasattr(e.message, 'review'):
-            review = e.message.review
-            print(f"[BRR] 📝 Отзыв из e.message.review")
-        else:
-            print(f"[BRR] ⚠️ Не удалось получить отзыв из события")
-            return
-        
+        # Получаем отзыв
+        review = getattr(e, 'review', None)
         if not review:
-            print(f"[BRR] ⚠️ Отзыв пустой")
+            print(f"[BRR] ⚠️ Отзыв не найден в событии")
             return
         
-        # 🔥 ИЗВЛЕКАЕМ ДАННЫЕ
-        review_text = review.text if hasattr(review, 'text') else str(review)
-        review_stars = review.stars if hasattr(review, 'stars') else 0
-        order_id = review.order_id if hasattr(review, 'order_id') else None
-        chat_id = e.chat_id if hasattr(e, 'chat_id') else e.chat.id
+        # Получаем данные из отзыва
+        review_text = getattr(review, 'text', '') or ''
+        review_stars = getattr(review, 'stars', 0)
+        order_id = getattr(review, 'order_id', None)
+        
+        chat_id = getattr(e, 'chat_id', None)
+        if not chat_id:
+            chat_id = getattr(review, 'chat_id', None)
+        if not chat_id and order_id:
+            try:
+                order = cardinal.account.get_order(order_id)
+                if order:
+                    chat_id = getattr(order, 'chat_id', None)
+            except:
+                pass
         
         print(f"[BRR] 📋 Данные отзыва:")
-        print(f"[BRR]    Текст: {review_text[:50]}...")
+        print(f"[BRR]    Текст: {review_text[:50]}..." if review_text else "[BRR]    Текст: (пусто)")
         print(f"[BRR]    Звёзды: {review_stars}")
         print(f"[BRR]    Заказ: {order_id}")
         print(f"[BRR]    Чат: {chat_id}")
         
-        # 🔥 ПРОВЕРЯЕМ ПЛОХОЙ ЛИ ОТЗЫВ
-        is_bad = False
-        reason = []
-        
-        if SETTINGS.get("check_by_stars", False):
-            min_stars = SETTINGS.get("min_stars", 0)
-            if review_stars <= min_stars:
-                is_bad = True
-                reason.append(f"звёзды ({review_stars})")
-                print(f"[BRR] ⭐ Проверка по звёздам: {review_stars} <= {min_stars} -> ДА")
-            else:
-                print(f"[BRR] ⭐ Проверка по звёздам: {review_stars} <= {min_stars} -> НЕТ")
-        else:
-            if review_text and check_bad_review(review_text):
-                is_bad = True
-                reason.append("текст")
-                print(f"[BRR] 📝 Проверка по тексту: найдены плохие слова -> ДА")
-            else:
-                print(f"[BRR] 📝 Проверка по тексту: плохих слов нет -> НЕТ")
-        
-        if not is_bad:
-            print(f"[BRR] ✅ Отзыв не является плохим, возврат не требуется")
-            return
-        
-        print(f"[BRR] ⚠️ Обнаружен ПЛОХОЙ отзыв! Причина: {', '.join(reason)}")
-        
-        # 🔥 ПРОВЕРЯЕМ НЕ ОБРАБАТЫВАЛИ ЛИ УЖЕ
+        # Проверяем, не обрабатывали ли уже этот заказ
         if order_id and order_id in processed_orders:
             elapsed = time.time() - processed_orders[order_id]
             if elapsed < 3600:
                 print(f"[BRR] ⏸️ Заказ {order_id} уже обработан {int(elapsed)}с назад, пропускаем")
                 return
         
+        # 🔥 ПРОВЕРЯЕМ СУММУ ЗАКАЗА (если есть order_id)
+        if order_id:
+            try:
+                order = cardinal.account.get_order(order_id)
+                if order:
+                    order_price = get_order_price(order)
+                    max_price = SETTINGS.get("max_refund_price", 10)
+                    
+                    if order_price > max_price:
+                        print(f"[BRR] ❌ Сумма заказа {order_price}₽ > {max_price}₽ → возврат НЕ ДЕЛАЕТСЯ")
+                        cardinal.send_message(chat_id, f"ℹ️ Возврат не выполнен (сумма заказа {order_price}₽ превышает лимит {max_price}₽)")
+                        return
+            except:
+                pass
+        
+        # 🔥 ГЛАВНАЯ ЛОГИКА: 1-4 звезды → возврат сразу
+        is_bad = False
+        reason = ""
+        
+        if review_stars <= 4:
+            is_bad = True
+            reason = f"низкая оценка ({review_stars} звезд)"
+            print(f"[BRR] ⭐ {review_stars} звезд → возврат сразу (без проверки слов)")
+        else:
+            # 5 звезд → проверяем слова
+            if review_text and check_bad_review(review_text):
+                is_bad = True
+                reason = "плохие слова в отзыве (5 звезд)"
+                print(f"[BRR] ⭐ 5 звезд, но найдены плохие слова → возврат")
+            else:
+                print(f"[BRR] ⭐ 5 звезд, плохих слов нет → возврат НЕ требуется")
+        
+        if not is_bad:
+            return
+        
         if order_id:
             processed_orders[order_id] = time.time()
             print(f"[BRR] 📝 Заказ {order_id} добавлен в историю")
         
-        # 🔥 ДЕЛАЕМ ВОЗВРАТ
-        if order_id:
-            print(f"[BRR] 🔄 Запуск возврата по заказу {order_id}...")
-            refund_order(chat_id, order_id, review_text, review_stars)
+        # Делаем возврат
+        if order_id and chat_id:
+            print(f"[BRR] 🔄 Запуск возврата по заказу {order_id} (причина: {reason})...")
+            refund_order(chat_id, order_id, review_text, review_stars, reason)
         else:
-            print(f"[BRR] ❌ ID заказа НЕ НАЙДЕН в отзыве!")
+            print(f"[BRR] ❌ Не хватает данных для возврата: order_id={order_id}, chat_id={chat_id}")
         
-        # 🔥 ОЧИЩАЕМ СТАРЫЕ ЗАПИСИ
+        # Очищаем старые записи
         now = time.time()
         for oid in list(processed_orders.keys()):
             if now - processed_orders[oid] > 86400:
@@ -275,8 +297,8 @@ def show_menu(message):
         callback_data="brr_refund_toggle"
     ))
     kb.add(InlineKeyboardButton(
-        f"{'⭐' if SETTINGS.get('check_by_stars', False) else '📝'} Проверка: {'По звёздам' if SETTINGS.get('check_by_stars', False) else 'По тексту'}",
-        callback_data="brr_check_mode"
+        f"💰 Лимит: {SETTINGS.get('max_refund_price', 10)}₽",
+        callback_data="brr_change_limit"
     ))
     kb.add(InlineKeyboardButton("✏️ Сменить текст возврата", callback_data="brr_edit_text"))
     kb.add(InlineKeyboardButton("📝 Список плохих слов", callback_data="brr_show_words"))
@@ -284,13 +306,13 @@ def show_menu(message):
     kb.add(InlineKeyboardButton("🗑️ Очистить историю", callback_data="brr_clear_history"))
     kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="brr_refresh"))
     
-    check_mode = "По звёздам" if SETTINGS.get("check_by_stars", False) else "По тексту (звёзды НЕ важны)"
-    
     text = (
         f"💰 **Bad Review Refund v{VERSION}**\n\n"
         f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
         f"📌 **Возвраты:** {'🟢 Включены' if SETTINGS.get('refund_enabled', True) else '🔴 Отключены'}\n"
-        f"🔍 **Режим проверки:** {check_mode}\n"
+        f"💰 **Макс. сумма возврата:** {SETTINGS.get('max_refund_price', 10)}₽\n"
+        f"⭐ **Логика:** 1-4 звёзды → возврат сразу\n"
+        f"⭐ **Логика:** 5 звёзд → возврат только при плохих словах\n"
         f"📝 **Плохих слов:** {len(SETTINGS.get('bad_words', []))}\n"
         f"🔄 **Обработано заказов:** {len(processed_orders)}\n\n"
         f"💬 **Текст возврата:**\n{SETTINGS.get('refund_message', '')[:100]}..."
@@ -325,8 +347,9 @@ def init_plugin(c):
     
     print("=" * 50)
     print("[BRR] 💰 ЗАГРУЗКА Bad Review Refund v1.0")
-    print("[BRR] 🔄 Автоматический возврат при плохих отзывах")
-    print("[BRR] 🔥 Возврат ДАЖЕ при 5 звёздах (есть плохие слова)")
+    print("[BRR] ⭐ 1-4 звёзды → возврат сразу")
+    print("[BRR] ⭐ 5 звёзд → возврат только при плохих словах")
+    print(f"[BRR] 💰 Макс. сумма возврата: {SETTINGS.get('max_refund_price', 10)}₽")
     print("=" * 50)
     
     load_config()
@@ -348,13 +371,11 @@ def init_plugin(c):
         bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['refund_enabled'] else 'OFF'}")
         show_menu(call.message)
     
-    @bot.callback_query_handler(func=lambda call: call.data == "brr_check_mode")
-    def check_mode(call):
-        SETTINGS["check_by_stars"] = not SETTINGS.get("check_by_stars", False)
-        save_config()
-        mode = "по звёздам" if SETTINGS["check_by_stars"] else "по тексту (звёзды НЕ важны)"
-        bot.answer_callback_query(call.id, f"Режим: {mode}")
-        show_menu(call.message)
+    @bot.callback_query_handler(func=lambda call: call.data == "brr_change_limit")
+    def change_limit(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "💰 Введите новую максимальную сумму для возврата:\n(например: 10, 50, 100)")
+        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, "brr_change_limit")
     
     @bot.callback_query_handler(func=lambda call: call.data == "brr_edit_text")
     def edit_text(call):
@@ -396,7 +417,20 @@ def init_plugin(c):
         
         action = state.get("action")
         
-        if action == "brr_edit_text":
+        if action == "brr_change_limit":
+            try:
+                new_limit = float(message.text.strip())
+                if new_limit >= 0:
+                    SETTINGS["max_refund_price"] = new_limit
+                    save_config()
+                    bot.reply_to(message, f"✅ Лимит возврата установлен: {new_limit}₽")
+                else:
+                    bot.reply_to(message, "❌ Введите положительное число!")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число!")
+            show_menu(message)
+        
+        elif action == "brr_edit_text":
             SETTINGS["refund_message"] = message.text.strip()
             save_config()
             bot.reply_to(message, "✅ Текст возврата обновлён!")
@@ -420,9 +454,7 @@ def init_plugin(c):
     print("=" * 50)
     print("[BRR] ✅ ПЛАГИН ЗАГРУЖЕН!")
     print("[BRR] 📌 /brr — меню настроек")
-    print("[BRR] 🔄 Автоматический возврат при плохих отзывах")
-    print("[BRR] 🔥 Возврат ДАЖЕ при 5 звёздах")
-    print("[BRR] 📋 СМОТРИ КОНСОЛЬ ДЛЯ ЛОГОВ")
+    print(f"[BRR] 💰 Макс. сумма возврата: {SETTINGS.get('max_refund_price', 10)}₽")
     print("=" * 50)
 
 # ============================================
@@ -430,6 +462,6 @@ def init_plugin(c):
 # ============================================
 
 BIND_TO_PRE_INIT = [init_plugin]
-BIND_TO_NEW_MESSAGE = [review_handler]
-BIND_TO_LAST_CHAT_MESSAGE_CHANGED = [review_handler]
+BIND_TO_NEW_REVIEW = [review_handler]
+BIND_TO_REVIEW_CHANGED = [review_handler]
 BIND_TO_DELETE = None
