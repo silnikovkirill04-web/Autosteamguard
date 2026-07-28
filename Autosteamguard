@@ -13,7 +13,7 @@ from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "Bad Review Refund"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DESCRIPTION = "Автоматический возврат при плохом отзыве (только до 10₽)"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
@@ -35,15 +35,39 @@ DEFAULT_SETTINGS = {
     "max_refund_price": 10,
     "check_interval": 60,
     "bad_words": [
-        "говно", "хуйня", "херня", "фигня", "дерьмо", "мусор",
-        "плохо", "ужасно", "отвратительно", "кошмар", "беда",
-        "не работает", "не пришло", "не получил", "обман", "лохотрон",
-        "кидала", "кинул", "обманул", "скам", "мошенник", "развод",
-        "зря", "жаль", "расстроен", "разочарован",
+        # 🔥 ОСНОВНЫЕ НЕГАТИВНЫЕ СЛОВА
+        "говно", "говнище", "говнецо", "говённый", "говноватый",
+        "хуйня", "херня", "фигня", "хрень", "чушь", "бред", "ерунда",
+        "дерьмо", "дерьмовый", "мусор", "мусорный",
+        "плохо", "плохой", "плохая", "плохое", "худший", "худшая", "худшее",
+        "ужасно", "ужасный", "ужасная", "ужасное", "кошмар", "кошмарный",
+        "отвратительно", "отвратительный", "беда",
+        
+        # 🔥 ПРОБЛЕМЫ С ТОВАРОМ
+        "не работает", "неработает", "нерабочий", "сломалось", "битый",
+        "не пришло", "не получил", "не пришел", "не пришёл",
+        "обман", "лохотрон", "развод", "кидала", "кинул", "кидает",
+        "обманул", "обманывает", "скам", "скамер", "мошенник",
+        
+        # 🔥 ЭМОЦИОНАЛЬНЫЕ
+        "зря", "жаль", "расстроен", "расстроена", "разочарован", "разочарована",
         "ужас", "бардак", "хам", "грубо", "неадекват",
-        "долго", "тупит", "глючит", "лагает",
-        "0 звезд", "0 звёзд", "1 звезда", "1 звёзд",
-        "5 звезд", "5 звёзд", "пять звезд", "пять звёзд", "отлично"
+        "долго", "тупит", "глючит", "лагает", "тормозит", "виснет",
+        
+        # 🔥 ОЦЕНКИ
+        "0 звезд", "0 звёзд", "ноль звезд", "ноль звёзд",
+        "1 звезда", "1 звёзд", "одна звезда", "одна звёзд",
+        "2 звезды", "2 звёзд", "две звезды", "две звёзд",
+        "3 звезды", "3 звёзд", "три звезды", "три звёзд",
+        
+        # 🔥 ДОПОЛНИТЕЛЬНЫЕ
+        "ужасный сервис", "плохой сервис", "отвратительный сервис",
+        "не доволен", "не довольна", "недоволен", "недовольна",
+        "разочарование", "негатив", "негативный",
+        "так себе", "средне", "ниже среднего",
+        "не стоит", "не окупилось", "зря потратил", "зря потратила",
+        "не советую", "не рекомендую", "не буду покупать",
+        "обслуживание", "поддержка", "помощь", "не отвечает"
     ],
     "refund_message": "✅ Возврат выполнен. Извините за неудобства!",
     "admin_notify": True,
@@ -127,23 +151,12 @@ def get_order_price(order):
     except:
         return 0
 
-def make_refund(order_id, chat_id):
+def make_refund(order, chat_id):
     """Делает возврат по заказу"""
     try:
-        # 🔥 СНАЧАЛА ПОЛУЧАЕМ ЗАКАЗ
-        order = cardinal.account.get_order(order_id)
-        if not order:
-            logger.error(f"❌ Заказ {order_id} не найден")
-            return False
-        
-        # 🔥 ДЕЛАЕМ ВОЗВРАТ ЧЕРЕЗ ОБЪЕКТ ЗАКАЗА
-        if hasattr(order, 'refund'):
-            order.refund()
-        else:
-            # fallback
-            cardinal.account.refund(order)
-        
-        logger.info(f"✅ Возврат по заказу {order_id} выполнен!")
+        # 🔥 ИСПРАВЛЕНО: передаём ОБЪЕКТ ЗАКАЗА, а не ID
+        cardinal.account.refund(order)
+        logger.info(f"✅ Возврат по заказу {order.id} выполнен!")
         return True
     except Exception as e:
         logger.error(f"❌ Ошибка возврата: {e}")
@@ -184,6 +197,13 @@ def review_checker():
             # 🔥 ПРОВЕРЯЕМ КАЖДЫЙ ЧАТ
             for chat_id, chat in chats.items():
                 try:
+                    # 🔥 ПОЛУЧАЕМ ID ЗАКАЗА ИЗ ЧАТА (node_id)
+                    order_id = getattr(chat, 'node_id', None)
+                    
+                    # Если нет node_id — это не заказ
+                    if not order_id:
+                        continue
+                    
                     # Получаем последние сообщения
                     msgs = cardinal.account.get_chat_history(chat_id, limit=5)
                     if not msgs:
@@ -206,29 +226,6 @@ def review_checker():
                         if stars is None:
                             continue
                         
-                        # 🔥 ПЫТАЕМСЯ НАЙТИ ЗАКАЗ
-                        # Ищем номер заказа в сообщении или чате
-                        order_id = None
-                        
-                        # Вариант 1: ищем в тексте сообщения
-                        order_match = re.search(r'заказ[аы]?\s*[№#]?\s*(\d+)', msg_text, re.IGNORECASE)
-                        if order_match:
-                            order_id = order_match.group(1)
-                        
-                        # Вариант 2: ищем в чате
-                        if not order_id:
-                            try:
-                                # Пробуем получить заказ по чату
-                                order = cardinal.account.get_order_by_chat(chat_id)
-                                if order:
-                                    order_id = order.id
-                            except:
-                                pass
-                        
-                        if not order_id:
-                            logger.warning(f"⚠️ Не удалось найти заказ для чата {chat_id}")
-                            continue
-                        
                         # 🔥 ПРОВЕРЯЕМ, НЕ ОБРАБАТЫВАЛИ ЛИ УЖЕ
                         processed = SETTINGS.get("processed_orders", {})
                         if order_id in processed:
@@ -236,17 +233,23 @@ def review_checker():
                             if elapsed < 86400:
                                 continue
                         
-                        # 🔥 ПРОВЕРЯЕМ СУММУ ЗАКАЗА
+                        # 🔥 ПОЛУЧАЕМ ЗАКАЗ ПО ID
                         try:
-                            order = cardinal.account.get_order(order_id)
-                            if order:
-                                order_price = get_order_price(order)
-                                max_price = SETTINGS.get("max_refund_price", 10)
-                                if order_price > max_price:
-                                    logger.info(f"💰 Сумма {order_price}₽ > {max_price}₽, пропускаем")
-                                    continue
-                        except:
-                            pass
+                            # 🔥 ИСПРАВЛЕНО: get_order_by_id
+                            order = cardinal.account.get_order_by_id(order_id)
+                            if not order:
+                                logger.warning(f"⚠️ Заказ {order_id} не найден")
+                                continue
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка получения заказа {order_id}: {e}")
+                            continue
+                        
+                        # 🔥 ПРОВЕРЯЕМ СУММУ ЗАКАЗА
+                        order_price = get_order_price(order)
+                        max_price = SETTINGS.get("max_refund_price", 10)
+                        if order_price > max_price:
+                            logger.info(f"💰 Сумма {order_price}₽ > {max_price}₽, пропускаем")
+                            continue
                         
                         # 🔥 ОПРЕДЕЛЯЕМ, ПЛОХОЙ ЛИ ОТЗЫВ
                         is_bad = False
@@ -271,7 +274,8 @@ def review_checker():
                         if chat_id:
                             cardinal.send_message(chat_id, "⏳ Проверяю возможность возврата...")
                         
-                        if make_refund(order_id, chat_id):
+                        # 🔥 ИСПРАВЛЕНО: передаём ОБЪЕКТ ЗАКАЗА
+                        if make_refund(order, chat_id):
                             # Отмечаем как обработанный
                             SETTINGS["processed_orders"][order_id] = time.time()
                             save_config()
@@ -400,7 +404,7 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[BRR] 💰 ЗАГРУЗКА Bad Review Refund v1.3")
+    print("[BRR] 💰 ЗАГРУЗКА Bad Review Refund v1.4")
     print("[BRR] 🔄 Парсинг системных сообщений")
     print(f"[BRR] 💰 Макс. сумма возврата: {SETTINGS.get('max_refund_price', 10)}₽")
     print("=" * 50)
@@ -439,7 +443,8 @@ def init_plugin(c):
     def change_limit_cb(call):
         bot.answer_callback_query(call.id)
         msg = bot.send_message(call.message.chat.id, "💰 Введите новую максимальную сумму для возврата (например: 10, 50, 100):")
-        tg.set_state(call.message.chat.id, msg.id, call.from_user.id, "brr_change_limit")
+        # 🔥 ИСПРАВЛЕНО: 3 аргумента, без msg.id
+        tg.set_state(call.message.chat.id, call.from_user.id, "brr_change_limit")
     
     # Регистрируем через tg.cbq_handler
     tg.cbq_handler(toggle_cb, lambda call: call.data == "brr_toggle")
