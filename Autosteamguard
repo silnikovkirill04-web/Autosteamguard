@@ -1,12 +1,11 @@
-
 """
-AutoReply — Автоответы с КД
-Отвечает на ЛЮБОЕ сообщение с настраиваемым КД
-Работает только в ночное время (22:30 - 7:59)
+AutoReply — Автоответы по шаблонам
+Создание и настройка шаблонов через меню
 """
 import uuid as uuid_lib
 import json
 import os
+import re
 import time
 import threading
 import logging
@@ -14,8 +13,8 @@ from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "AutoReply"
-VERSION = "2.4.0"
-DESCRIPTION = "Автоответы в ночное время (22:30 - 7:59)"
+VERSION = "2.5.0"
+DESCRIPTION = "Автоответы по шаблонам"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
@@ -50,23 +49,18 @@ logger.addHandler(console_handler)
 # 🔥 НАСТРОЙКИ
 DEFAULT_SETTINGS = {
     "active": True,
-    "auto_reply_enabled": True,
-    "reply_cooldown": 3600,
-    "admin_notify": True,
-    "reply_message": "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.",
-    "work_start": "22:30",  # Начало ночного режима
-    "work_end": "07:59",    # Конец ночного режима
-    "last_reply_time": {},
+    "templates": {},  # {id: {"name": "", "time": "", "message": "", "active": True}}
 }
 
 SETTINGS = DEFAULT_SETTINGS.copy()
+template_counter = 1
 
 # ============================================
 # 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
 # ============================================
 
 def load_config():
-    global SETTINGS
+    global SETTINGS, template_counter
     try:
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -79,6 +73,11 @@ def load_config():
     except Exception as e:
         logger.error(f"Ошибка загрузки конфига: {e}")
         save_config()
+    
+    templates = SETTINGS.get("templates", {})
+    if templates:
+        max_id = max([int(k) for k in templates.keys()]) if templates else 0
+        template_counter = max_id + 1
 
 def save_config():
     try:
@@ -88,132 +87,76 @@ def save_config():
     except Exception as e:
         logger.error(f"Ошибка сохранения: {e}")
 
-def is_night_time():
-    """Проверяет, сейчас ночное время (22:30 - 7:59)"""
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
-    
-    start = SETTINGS.get("work_start", "22:30")
-    end = SETTINGS.get("work_end", "07:59")
-    
-    # Если время в диапазоне 22:30 - 23:59
-    if current_time >= start and current_time <= "23:59":
-        return True
-    
-    # Если время в диапазоне 00:00 - 07:59
-    if current_time >= "00:00" and current_time <= end:
-        return True
-    
-    return False
+def get_current_time():
+    return datetime.now().strftime("%H:%M")
 
-def format_text_with_variables(text, username=None):
-    if not text:
-        return text
+def check_templates():
+    """Проверяет шаблоны и отправляет сообщения"""
+    templates = SETTINGS.get("templates", {})
+    current_time = get_current_time()
     
-    text = text.replace("{date}", datetime.now().strftime("%d.%m.%Y"))
-    text = text.replace("{time}", datetime.now().strftime("%H:%M"))
-    text = text.replace("{datetime}", datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
-    
-    if cardinal.account:
-        username_acc = cardinal.account.username if hasattr(cardinal.account, 'username') else ""
-        text = text.replace("{username}", username_acc)
-    
-    if username:
-        text = text.replace("{buyer_username}", username)
-    
-    return text
-
-def can_send_reply(chat_id):
-    """Проверяет КД"""
-    last_reply_time = SETTINGS.get("last_reply_time", {})
-    now = time.time()
-    last_reply = last_reply_time.get(str(chat_id), 0)
-    cooldown = SETTINGS.get("reply_cooldown", 3600)
-    
-    if now - last_reply < cooldown:
-        remaining = int(cooldown - (now - last_reply))
-        logger.debug(f"⏸️ КД для чата {chat_id}: осталось {remaining}с")
-        return False
-    
-    return True
-
-def update_last_reply(chat_id):
-    """Обновляет время последнего ответа"""
-    last_reply_time = SETTINGS.get("last_reply_time", {})
-    last_reply_time[str(chat_id)] = time.time()
-    SETTINGS["last_reply_time"] = last_reply_time
-    save_config()
-
-# ============================================
-# 🔄 ОБРАБОТЧИК СООБЩЕНИЙ
-# ============================================
-
-def message_handler(msg_obj):
-    """Обрабатывает новое сообщение через хук BIND_TO_NEW_MESSAGE"""
-    
-    if not SETTINGS.get("active", True):
-        return
-    
-    if not SETTINGS.get("auto_reply_enabled", True):
-        return
-    
-    # 🔥 ПРОВЕРКА: РАБОТАЕМ ТОЛЬКО В НОЧНОЕ ВРЕМЯ
-    if not is_night_time():
-        return
-    
-    try:
-        # Проверяем, что сообщение не от нас
-        if getattr(msg_obj, "is_employee", False):
-            return
-        
-        # Получаем chat_id
-        chat_id = getattr(msg_obj, "chat_id", None) or getattr(msg_obj, "node_id", None)
-        if not chat_id:
-            return
-        
-        # Проверяем КД
-        if not can_send_reply(chat_id):
-            return
-        
-        # Получаем имя покупателя
-        username = None
-        if hasattr(msg_obj, "author"):
-            username = msg_obj.author
-        elif hasattr(msg_obj, "user_name"):
-            username = msg_obj.user_name
-        
-        # 🔥 ОТПРАВЛЯЕМ ОТВЕТ СРАЗУ (без задержки)
+    for template_id, template in templates.items():
         try:
-            reply_text = SETTINGS.get("reply_message", 
-                "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.")
-            reply_text = format_text_with_variables(reply_text, username)
+            if not template.get("active", True):
+                continue
             
-            # Отправка в чат FunPay
-            if hasattr(cardinal.account, 'send_message'):
-                cardinal.account.send_message(chat_id, reply_text)
-            else:
-                cardinal.send_message(chat_id, reply_text)
+            if template.get("time") != current_time:
+                continue
             
-            update_last_reply(chat_id)
+            last_sent = template.get("last_sent")
+            if last_sent:
+                last_date = datetime.fromisoformat(last_sent)
+                if last_date.date() == datetime.now().date():
+                    continue
             
-            logger.info(f"📤 Отправлен ночной автоответ в чат {chat_id}")
+            # Отправляем сообщение во все чаты
+            send_template_message(template)
             
-            if SETTINGS.get("admin_notify", True):
-                admin_id = SETTINGS.get("admin_chat_id")
-                if admin_id:
-                    admin_msg = (
-                        f"💬 **Ночной автоответ отправлен!**\n\n"
-                        f"🆔 Чат: {chat_id}\n"
-                        f"👤 Пользователь: {username or 'Неизвестно'}\n"
-                        f"🌙 Время: {datetime.now().strftime('%H:%M')}\n"
-                        f"📅 Дата: {datetime.now().strftime('%d.%m.%Y')}"
-                    )
-                    cardinal.send_message(admin_id, admin_msg)
+            template["last_sent"] = datetime.now().isoformat()
+            save_config()
+            
+            logger.info(f"📤 Отправлен шаблон '{template.get('name', 'Без имени')}'")
+            
         except Exception as e:
-            logger.error(f"❌ Ошибка отправки ответа: {e}")
+            logger.error(f"❌ Ошибка шаблона {template_id}: {e}")
+
+def send_template_message(template):
+    """Отправляет сообщение по шаблону во все чаты"""
+    try:
+        # Получаем все чаты (если есть метод)
+        if hasattr(cardinal.account, 'get_chats'):
+            chats = cardinal.account.get_chats()
+        else:
+            return
         
+        if not chats:
+            return
+        
+        message_text = template.get("message", "")
+        if not message_text:
+            return
+        
+        for chat in chats:
+            try:
+                chat_id = chat.id if hasattr(chat, 'id') else chat
+                cardinal.account.send_message(chat_id, message_text)
+                time.sleep(0.3)
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки: {e}")
+                
     except Exception as e:
-        logger.error(f"❌ Ошибка обработки сообщения: {e}")
+        logger.error(f"❌ Ошибка отправки шаблона: {e}")
+
+def schedule_worker():
+    """Фоновый поток для проверки расписания"""
+    while True:
+        try:
+            if SETTINGS.get("active", True):
+                check_templates()
+            time.sleep(30)
+        except Exception as e:
+            logger.error(f"❌ Ошибка в планировщике: {e}")
+            time.sleep(60)
 
 # ============================================
 # 📱 ИНТЕРФЕЙС
@@ -226,83 +169,90 @@ def show_menu(message):
         callback_data="ar_toggle"
     ))
     kb.add(InlineKeyboardButton(
-        f"{'🟢' if SETTINGS.get('auto_reply_enabled', True) else '🔴'} Автоответы: {'ВКЛ' if SETTINGS.get('auto_reply_enabled', True) else 'ВЫКЛ'}",
-        callback_data="ar_reply_toggle"
+        f"📋 Шаблоны ({len(SETTINGS.get('templates', {}))})",
+        callback_data="ar_templates"
     ))
     kb.add(InlineKeyboardButton(
-        f"⏰ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
-        callback_data="ar_cooldown_settings"
+        "➕ Добавить шаблон",
+        callback_data="ar_add_template"
     ))
     kb.add(InlineKeyboardButton(
-        f"🌙 Ночной режим: {SETTINGS.get('work_start', '22:30')} - {SETTINGS.get('work_end', '07:59')}",
-        callback_data="ar_time_settings"
-    ))
-    kb.add(InlineKeyboardButton(
-        f"📝 Сменить текст ответа",
-        callback_data="ar_edit_message"
-    ))
-    kb.add(InlineKeyboardButton(
-        f"🔄 Обновить",
+        "🔄 Обновить",
         callback_data="ar_refresh"
     ))
-    
-    last_reply_time = SETTINGS.get("last_reply_time", {})
-    night_active = "🟢 Активен" if is_night_time() else "🔴 Неактивен"
     
     text = (
         f"💬 **AutoReply v{VERSION}**\n\n"
         f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
-        f"📌 **Автоответы:** {'🟢 Включены' if SETTINGS.get('auto_reply_enabled', True) else '🔴 Отключены'}\n"
-        f"🌙 **Ночной режим:** {night_active}\n"
-        f"⏰ **Время работы:** {SETTINGS.get('work_start', '22:30')} - {SETTINGS.get('work_end', '07:59')}\n"
-        f"⏰ **КД:** {SETTINGS.get('reply_cooldown', 3600)//60} мин\n"
-        f"💬 **Активных КД:** {len(last_reply_time)}\n\n"
-        f"💬 **Текст ответа:**\n{SETTINGS.get('reply_message', '')[:100]}..."
+        f"📋 **Шаблонов:** {len(SETTINGS.get('templates', {}))}\n\n"
+        f"💬 Создайте шаблон с текстом и временем отправки."
     )
     
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
-def show_time_settings(message):
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton(
-        f"✏️ Начало: {SETTINGS.get('work_start', '22:30')}",
-        callback_data="ar_time_start"
-    ))
-    kb.add(InlineKeyboardButton(
-        f"✏️ Конец: {SETTINGS.get('work_end', '07:59')}",
-        callback_data="ar_time_end"
-    ))
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_menu"))
+def show_templates(message):
+    templates = SETTINGS.get("templates", {})
     
-    text = (
-        f"🌙 **Настройка ночного режима**\n\n"
-        f"Текущее время: **{datetime.now().strftime('%H:%M')}**\n"
-        f"Ночной режим: **{'🟢 Активен' if is_night_time() else '🔴 Неактивен'}**\n\n"
-        f"Начало: **{SETTINGS.get('work_start', '22:30')}**\n"
-        f"Конец: **{SETTINGS.get('work_end', '07:59')}**\n\n"
-        f"В этом интервале бот будет отвечать на сообщения."
-    )
+    kb = InlineKeyboardMarkup(row_width=1)
+    
+    if templates:
+        text = "📋 **Ваши шаблоны:**\n\n"
+        for template_id, template in sorted(templates.items(), key=lambda x: int(x[0])):
+            status = "🟢" if template.get("active", True) else "🔴"
+            text += f"{status} **{template.get('name', 'Без имени')}**\n"
+            text += f"   ⏰ {template.get('time', 'Не указано')}\n"
+            text += f"   💬 {template.get('message', '')[:50]}...\n\n"
+            
+            kb.add(InlineKeyboardButton(
+                f"✏️ {template.get('name', 'Без имени')}",
+                callback_data=f"ar_edit_template_{template_id}"
+            ))
+    else:
+        text = "📋 **У вас нет шаблонов**\n\nНажмите '➕ Добавить шаблон'"
+    
+    kb.add(InlineKeyboardButton("➕ Добавить шаблон", callback_data="ar_add_template"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_menu"))
     
     bot.send_message(message.chat.id, text, reply_markup=kb)
 
-def show_cooldown_settings(message):
+def show_template_edit(message, template_id):
+    templates = SETTINGS.get("templates", {})
+    template = templates.get(template_id, {})
+    
+    if not template:
+        bot.send_message(message.chat.id, "❌ Шаблон не найден")
+        show_templates(message)
+        return
+    
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton(
-        f"✏️ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
-        callback_data="ar_cooldown_value"
+        f"{'🟢' if template.get('active', True) else '🔴'} Статус",
+        callback_data=f"ar_template_toggle_{template_id}"
     ))
     kb.add(InlineKeyboardButton(
-        "🔄 Сбросить КД для всех чатов",
-        callback_data="ar_cooldown_reset"
+        f"✏️ Название: {template.get('name', 'Без имени')}",
+        callback_data=f"ar_template_name_{template_id}"
     ))
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_menu"))
+    kb.add(InlineKeyboardButton(
+        f"⏰ Время: {template.get('time', 'Не указано')}",
+        callback_data=f"ar_template_time_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"💬 Изменить текст",
+        callback_data=f"ar_template_message_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🗑️ Удалить шаблон",
+        callback_data=f"ar_template_delete_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_templates"))
     
     text = (
-        f"⏰ **Настройка КД (перезарядки)**\n\n"
-        f"Текущее КД: **{SETTINGS.get('reply_cooldown', 3600)//60} минут**\n"
-        f"({SETTINGS.get('reply_cooldown', 3600)} секунд)\n\n"
-        f"КД — время, которое нужно подождать\n"
-        f"перед следующим ответом в том же чате."
+        f"✏️ **Редактирование шаблона**\n\n"
+        f"📌 **Название:** {template.get('name', 'Без имени')}\n"
+        f"📌 **Статус:** {'🟢 Активен' if template.get('active', True) else '🔴 Неактивен'}\n"
+        f"⏰ **Время:** {template.get('time', 'Не указано')}\n"
+        f"💬 **Текст:**\n{template.get('message', 'Не указан')[:200]}..."
     )
     
     bot.send_message(message.chat.id, text, reply_markup=kb)
@@ -312,15 +262,14 @@ def show_cooldown_settings(message):
 # ============================================
 
 def init_plugin(c):
-    global cardinal, tg, bot
+    global cardinal, tg, bot, template_counter
     cardinal = c
     tg = c.telegram
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.4")
-    print("[AR] 🌙 Ночной режим: 22:30 - 07:59")
-    print("[AR] ⏰ КД: без задержки")
+    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.5")
+    print("[AR] 🔄 Настройка шаблонов")
     print("=" * 50)
     
     load_config()
@@ -336,45 +285,60 @@ def init_plugin(c):
             return
         
         action = state.get("action")
+        data = state.get("data", {})
+        template_id = data.get("template_id")
         
-        if action == "ar_edit_message":
-            SETTINGS["reply_message"] = message.text.strip()
-            save_config()
-            bot.reply_to(message, "✅ Текст ответа обновлён!")
-            show_menu(message)
-        
-        elif action == "ar_time_start":
-            time_str = message.text.strip()
-            if re.match(r'^\d{2}:\d{2}$', time_str):
-                SETTINGS["work_start"] = time_str
+        if action == "ar_add_template_name":
+            name = message.text.strip()
+            if name:
+                templates = SETTINGS.get("templates", {})
+                new_id = str(template_counter)
+                templates[new_id] = {
+                    "name": name,
+                    "time": "08:00",
+                    "message": "Введите текст сообщения",
+                    "active": True,
+                    "last_sent": None
+                }
+                SETTINGS["templates"] = templates
+                template_counter += 1
                 save_config()
-                bot.reply_to(message, f"✅ Начало ночного режима: {time_str}")
+                bot.reply_to(message, f"✅ Шаблон '{name}' создан!")
+                show_templates(message)
             else:
-                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
-            show_time_settings(message)
+                bot.reply_to(message, "❌ Введите название!")
         
-        elif action == "ar_time_end":
-            time_str = message.text.strip()
-            if re.match(r'^\d{2}:\d{2}$', time_str):
-                SETTINGS["work_end"] = time_str
-                save_config()
-                bot.reply_to(message, f"✅ Конец ночного режима: {time_str}")
-            else:
-                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
-            show_time_settings(message)
-        
-        elif action == "ar_cooldown_value":
-            try:
-                value = int(message.text.strip())
-                if value >= 0:
-                    SETTINGS["reply_cooldown"] = value
+        elif action == "ar_template_name":
+            new_name = message.text.strip()
+            if new_name and template_id:
+                templates = SETTINGS.get("templates", {})
+                if template_id in templates:
+                    templates[template_id]["name"] = new_name
                     save_config()
-                    bot.reply_to(message, f"✅ КД установлено: {value} секунд ({value//60} мин)")
-                else:
-                    bot.reply_to(message, "❌ Введите положительное число!")
-            except ValueError:
-                bot.reply_to(message, "❌ Введите число!")
-            show_cooldown_settings(message)
+                    bot.reply_to(message, f"✅ Название обновлено!")
+                show_template_edit(message, template_id)
+        
+        elif action == "ar_template_time":
+            time_str = message.text.strip()
+            if re.match(r'^\d{2}:\d{2}$', time_str) and template_id:
+                templates = SETTINGS.get("templates", {})
+                if template_id in templates:
+                    templates[template_id]["time"] = time_str
+                    save_config()
+                    bot.reply_to(message, f"✅ Время обновлено: {time_str}")
+                show_template_edit(message, template_id)
+            else:
+                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
+        
+        elif action == "ar_template_message":
+            new_message = message.text.strip()
+            if new_message and template_id:
+                templates = SETTINGS.get("templates", {})
+                if template_id in templates:
+                    templates[template_id]["message"] = new_message
+                    save_config()
+                    bot.reply_to(message, f"✅ Текст обновлён!")
+                show_template_edit(message, template_id)
         
         tg.clear_state(message.chat.id, message.from_user.id)
     
@@ -387,12 +351,6 @@ def init_plugin(c):
         bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
         show_menu(call.message)
     
-    def reply_toggle_cb(call):
-        SETTINGS["auto_reply_enabled"] = not SETTINGS.get("auto_reply_enabled", True)
-        save_config()
-        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['auto_reply_enabled'] else 'OFF'}")
-        show_menu(call.message)
-    
     def refresh_cb(call):
         bot.answer_callback_query(call.id, "🔄 Обновлено")
         show_menu(call.message)
@@ -401,51 +359,72 @@ def init_plugin(c):
         bot.answer_callback_query(call.id)
         show_menu(call.message)
     
-    def edit_message_cb(call):
+    def show_templates_cb(call):
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "📝 Введите новый текст для автоответа:")
-        tg.set_state(call.message.chat.id, call.from_user.id, "ar_edit_message")
+        show_templates(call.message)
     
-    def time_settings_cb(call):
+    def add_template_cb(call):
         bot.answer_callback_query(call.id)
-        show_time_settings(call.message)
+        msg = bot.send_message(call.message.chat.id, "📝 Введите название нового шаблона:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_add_template_name")
     
-    def time_start_cb(call):
+    def edit_template_cb(call):
+        template_id = call.data.replace("ar_edit_template_", "")
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "🌙 Введите время начала ночного режима (HH:MM):")
-        tg.set_state(call.message.chat.id, call.from_user.id, "ar_time_start")
+        show_template_edit(call.message, template_id)
     
-    def time_end_cb(call):
+    def template_toggle_cb(call):
+        template_id = call.data.replace("ar_template_toggle_", "")
+        templates = SETTINGS.get("templates", {})
+        if template_id in templates:
+            templates[template_id]["active"] = not templates[template_id].get("active", True)
+            save_config()
+            bot.answer_callback_query(call.id, f"{'ON' if templates[template_id]['active'] else 'OFF'}")
+        show_template_edit(call.message, template_id)
+    
+    def template_name_cb(call):
+        template_id = call.data.replace("ar_template_name_", "")
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "🌙 Введите время окончания ночного режима (HH:MM):")
-        tg.set_state(call.message.chat.id, call.from_user.id, "ar_time_end")
+        msg = bot.send_message(call.message.chat.id, "✏️ Введите новое название шаблона:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_template_name", {"template_id": template_id})
     
-    def cooldown_settings_cb(call):
+    def template_time_cb(call):
+        template_id = call.data.replace("ar_template_time_", "")
         bot.answer_callback_query(call.id)
-        show_cooldown_settings(call.message)
+        msg = bot.send_message(call.message.chat.id, "⏰ Введите новое время (HH:MM):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_template_time", {"template_id": template_id})
     
-    def cooldown_value_cb(call):
+    def template_message_cb(call):
+        template_id = call.data.replace("ar_template_message_", "")
         bot.answer_callback_query(call.id)
-        msg = bot.send_message(call.message.chat.id, "✏️ Введите КД в секундах (например: 3600 = 1 час):")
-        tg.set_state(call.message.chat.id, call.from_user.id, "ar_cooldown_value")
+        msg = bot.send_message(call.message.chat.id, "💬 Введите новый текст для шаблона:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_template_message", {"template_id": template_id})
     
-    def cooldown_reset_cb(call):
-        SETTINGS["last_reply_time"] = {}
-        save_config()
-        bot.answer_callback_query(call.id, "✅ КД сброшен для всех чатов!")
-        show_cooldown_settings(call.message)
+    def template_delete_cb(call):
+        template_id = call.data.replace("ar_template_delete_", "")
+        templates = SETTINGS.get("templates", {})
+        if template_id in templates:
+            del templates[template_id]
+            save_config()
+            bot.answer_callback_query(call.id, "🗑️ Шаблон удалён!")
+        show_templates(call.message)
     
     tg.cbq_handler(toggle_cb, lambda call: call.data == "ar_toggle")
-    tg.cbq_handler(reply_toggle_cb, lambda call: call.data == "ar_reply_toggle")
     tg.cbq_handler(refresh_cb, lambda call: call.data == "ar_refresh")
     tg.cbq_handler(menu_cb, lambda call: call.data == "ar_menu")
-    tg.cbq_handler(edit_message_cb, lambda call: call.data == "ar_edit_message")
-    tg.cbq_handler(time_settings_cb, lambda call: call.data == "ar_time_settings")
-    tg.cbq_handler(time_start_cb, lambda call: call.data == "ar_time_start")
-    tg.cbq_handler(time_end_cb, lambda call: call.data == "ar_time_end")
-    tg.cbq_handler(cooldown_settings_cb, lambda call: call.data == "ar_cooldown_settings")
-    tg.cbq_handler(cooldown_value_cb, lambda call: call.data == "ar_cooldown_value")
-    tg.cbq_handler(cooldown_reset_cb, lambda call: call.data == "ar_cooldown_reset")
+    tg.cbq_handler(show_templates_cb, lambda call: call.data == "ar_templates")
+    tg.cbq_handler(add_template_cb, lambda call: call.data == "ar_add_template")
+    tg.cbq_handler(edit_template_cb, lambda call: call.data.startswith("ar_edit_template_"))
+    tg.cbq_handler(template_toggle_cb, lambda call: call.data.startswith("ar_template_toggle_"))
+    tg.cbq_handler(template_name_cb, lambda call: call.data.startswith("ar_template_name_"))
+    tg.cbq_handler(template_time_cb, lambda call: call.data.startswith("ar_template_time_"))
+    tg.cbq_handler(template_message_cb, lambda call: call.data.startswith("ar_template_message_"))
+    tg.cbq_handler(template_delete_cb, lambda call: call.data.startswith("ar_template_delete_"))
+    
+    # 🔥 ЗАПУСКАЕМ ПЛАНИРОВЩИК
+    schedule_thread = threading.Thread(target=schedule_worker, daemon=True)
+    schedule_thread.start()
+    logger.info("🔄 Планировщик запущен")
     
     print("[AR] ✅ Плагин загружен!")
     print("[AR] 📌 /ar — меню настроек")
@@ -456,5 +435,4 @@ def init_plugin(c):
 # ============================================
 
 BIND_TO_PRE_INIT = [init_plugin]
-BIND_TO_NEW_MESSAGE = [message_handler]
 BIND_TO_DELETE = None
