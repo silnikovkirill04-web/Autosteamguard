@@ -5,6 +5,7 @@ AutoReply — Автоответы с КД и периодом работы
 import uuid as uuid_lib
 import json
 import os
+import re
 import time
 import logging
 from datetime import datetime
@@ -150,7 +151,7 @@ def message_handler(msg_obj):
     if not SETTINGS.get("active", True):
         return
     
-    # 🔥 ПРОВЕРКА ПЕРИОДА РАБОТЫ
+    # Проверка периода работы
     if not is_work_time():
         return
     
