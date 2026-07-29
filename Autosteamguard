@@ -1,6 +1,6 @@
 """
-AutoReply — Автоответы с КД
-Отвечает на ЛЮБОЕ сообщение с настраиваемым КД
+AutoReply — Автоответы с КД и периодом работы
+Отвечает на ЛЮБОЕ сообщение в указанный период времени
 """
 import uuid as uuid_lib
 import json
@@ -11,8 +11,8 @@ from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "AutoReply"
-VERSION = "2.7.0"
-DESCRIPTION = "Автоответы с настраиваемым КД"
+VERSION = "2.8.0"
+DESCRIPTION = "Автоответы с КД и периодом работы"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
 SETTINGS_PAGE = True
@@ -49,6 +49,8 @@ DEFAULT_SETTINGS = {
     "active": True,
     "reply_message": "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.",
     "reply_cooldown": 86400,  # 1 день
+    "work_start": "22:30",    # Начало работы
+    "work_end": "07:59",      # Конец работы
     "admin_notify": True,
     "admin_chat_id": 0,
     "last_reply_time": {},
@@ -82,6 +84,25 @@ def save_config():
             json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Ошибка сохранения: {e}")
+
+def is_work_time():
+    """Проверяет, сейчас рабочий период"""
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    
+    start = SETTINGS.get("work_start", "22:30")
+    end = SETTINGS.get("work_end", "07:59")
+    
+    # Если период переходит через полночь (22:30 - 07:59)
+    if start > end:
+        if current_time >= start and current_time <= "23:59":
+            return True
+        if current_time >= "00:00" and current_time <= end:
+            return True
+        return False
+    else:
+        # Обычный период (08:00 - 20:00)
+        return start <= current_time <= end
 
 def format_text_with_variables(text, username=None):
     if not text:
@@ -127,6 +148,10 @@ def message_handler(msg_obj):
     """Обрабатывает новое сообщение через хук BIND_TO_NEW_MESSAGE"""
     
     if not SETTINGS.get("active", True):
+        return
+    
+    # 🔥 ПРОВЕРКА ПЕРИОДА РАБОТЫ
+    if not is_work_time():
         return
     
     try:
@@ -198,10 +223,16 @@ def show_menu(message):
     else:
         cooldown_text = f"{cooldown // 60} мин"
     
+    work_status = "🟢 Активен" if is_work_time() else "🔴 Неактивен"
+    
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton(
         f"{'🟢' if SETTINGS.get('active', True) else '🔴'} Плагин: {'ВКЛ' if SETTINGS.get('active', True) else 'ВЫКЛ'}",
         callback_data="ar_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🌙 Период: {SETTINGS.get('work_start', '22:30')} - {SETTINGS.get('work_end', '07:59')}",
+        callback_data="ar_time_settings"
     ))
     kb.add(InlineKeyboardButton(
         f"⏰ КД: {cooldown_text}",
@@ -221,9 +252,35 @@ def show_menu(message):
     text = (
         f"💬 **AutoReply v{VERSION}**\n\n"
         f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
+        f"🌙 **Период работы:** {work_status}\n"
+        f"⏰ **Время:** {SETTINGS.get('work_start', '22:30')} - {SETTINGS.get('work_end', '07:59')}\n"
         f"⏰ **КД:** {cooldown_text}\n"
         f"💬 **Активных КД:** {len(last_reply_time)}\n\n"
         f"💬 **Текст ответа:**\n{SETTINGS.get('reply_message', '')[:100]}..."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_time_settings(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"✏️ Начало: {SETTINGS.get('work_start', '22:30')}",
+        callback_data="ar_time_start"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"✏️ Конец: {SETTINGS.get('work_end', '07:59')}",
+        callback_data="ar_time_end"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_menu"))
+    
+    text = (
+        f"🌙 **Настройка периода работы**\n\n"
+        f"Текущее время: **{datetime.now().strftime('%H:%M')}**\n"
+        f"Период активен: **{'🟢 ДА' if is_work_time() else '🔴 НЕТ'}**\n\n"
+        f"Начало: **{SETTINGS.get('work_start', '22:30')}**\n"
+        f"Конец: **{SETTINGS.get('work_end', '07:59')}**\n\n"
+        f"В этом периоде бот будет отвечать на сообщения.\n"
+        f"Если начало > конца — период переходит через полночь."
     )
     
     bot.send_message(message.chat.id, text, reply_markup=kb)
@@ -265,8 +322,8 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.7")
-    print("[AR] 🔄 Автоответы с КД 1 день")
+    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.8")
+    print("[AR] 🔄 Автоответы с периодом работы")
     print("=" * 50)
     
     load_config()
@@ -288,6 +345,26 @@ def init_plugin(c):
             save_config()
             bot.reply_to(message, "✅ Текст ответа обновлён!")
             show_menu(message)
+        
+        elif action == "ar_time_start":
+            time_str = message.text.strip()
+            if re.match(r'^\d{2}:\d{2}$', time_str):
+                SETTINGS["work_start"] = time_str
+                save_config()
+                bot.reply_to(message, f"✅ Начало периода: {time_str}")
+            else:
+                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
+            show_time_settings(message)
+        
+        elif action == "ar_time_end":
+            time_str = message.text.strip()
+            if re.match(r'^\d{2}:\d{2}$', time_str):
+                SETTINGS["work_end"] = time_str
+                save_config()
+                bot.reply_to(message, f"✅ Конец периода: {time_str}")
+            else:
+                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
+            show_time_settings(message)
         
         elif action == "ar_cooldown_value":
             try:
@@ -329,6 +406,20 @@ def init_plugin(c):
         msg = bot.send_message(call.message.chat.id, "📝 Введите новый текст для автоответа:")
         tg.set_state(call.message.chat.id, call.from_user.id, "ar_edit_message")
     
+    def time_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_time_settings(call.message)
+    
+    def time_start_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "🌙 Введите время начала периода (HH:MM):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_time_start")
+    
+    def time_end_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "🌙 Введите время окончания периода (HH:MM):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_time_end")
+    
     def cooldown_settings_cb(call):
         bot.answer_callback_query(call.id)
         show_cooldown_settings(call.message)
@@ -348,12 +439,16 @@ def init_plugin(c):
     tg.cbq_handler(refresh_cb, lambda call: call.data == "ar_refresh")
     tg.cbq_handler(menu_cb, lambda call: call.data == "ar_menu")
     tg.cbq_handler(edit_message_cb, lambda call: call.data == "ar_edit_message")
+    tg.cbq_handler(time_settings_cb, lambda call: call.data == "ar_time_settings")
+    tg.cbq_handler(time_start_cb, lambda call: call.data == "ar_time_start")
+    tg.cbq_handler(time_end_cb, lambda call: call.data == "ar_time_end")
     tg.cbq_handler(cooldown_settings_cb, lambda call: call.data == "ar_cooldown_settings")
     tg.cbq_handler(cooldown_value_cb, lambda call: call.data == "ar_cooldown_value")
     tg.cbq_handler(cooldown_reset_cb, lambda call: call.data == "ar_cooldown_reset")
     
     print("[AR] ✅ Плагин загружен!")
     print("[AR] 📌 /ar — меню настроек")
+    print("[AR] 🌙 Период работы: 22:30 - 07:59")
     print("=" * 50)
 
 # ============================================
