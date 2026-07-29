@@ -1,1 +1,797 @@
+"""
+Schedule AutoReply — Автоответы по расписанию
+Отвечает на ЛЮБОЕ сообщение с задержкой и КД
+Использует правильные методы Cardinal
+"""
+import uuid as uuid_lib
+import json
+import os
+import re
+import time
+import threading
+import logging
+from datetime import datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+NAME = "Schedule AutoReply"
+VERSION = "2.2.0"
+DESCRIPTION = "Автоответы с настраиваемой задержкой и КД"
+CREDITS = "@qneiz"
+UUID = str(uuid_lib.uuid4())
+SETTINGS_PAGE = True
+
+CONFIG_PATH = "storage/cache/schedule_autoreply.json"
+LOG_PATH = "storage/cache/schedule_autoreply.log"
+
+cardinal = None
+tg = None
+bot = None
+
+# 🔥 Логгер
+logger = logging.getLogger("ScheduleAutoReply")
+logger.setLevel(logging.INFO)
+
+try:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+except:
+    pass
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
+# 🔥 НАСТРОЙКИ
+DEFAULT_SETTINGS = {
+    "active": True,
+    "auto_reply_enabled": True,
+    "reply_delay": 30,
+    "reply_delay_unit": "seconds",
+    "reply_cooldown": 3600,
+    "admin_notify": True,
+    "reply_message": "Здравствуйте! Я сейчас не у экрана. Оставьте ваше сообщение, я отвечу в ближайшее время.",
+    "templates": {},
+    "last_reply_time": {},  # {chat_id: timestamp}
+}
+
+SETTINGS = DEFAULT_SETTINGS.copy()
+schedule_counter = 1
+
+# ============================================
+# 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
+# ============================================
+
+def load_config():
+    global SETTINGS, schedule_counter
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                for k in loaded:
+                    if k in SETTINGS:
+                        SETTINGS[k] = loaded[k]
+        else:
+            save_config()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки конфига: {e}")
+        save_config()
+    
+    templates = SETTINGS.get("templates", {})
+    if templates:
+        max_id = max([int(k) for k in templates.keys()]) if templates else 0
+        schedule_counter = max_id + 1
+
+def save_config():
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+
+def get_delay_seconds():
+    delay = SETTINGS.get("reply_delay", 30)
+    unit = SETTINGS.get("reply_delay_unit", "seconds")
+    
+    if unit == "seconds":
+        return delay
+    elif unit == "minutes":
+        return delay * 60
+    elif unit == "hours":
+        return delay * 3600
+    elif unit == "days":
+        return delay * 86400
+    else:
+        return delay
+
+def get_day_name():
+    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    return days[datetime.now().weekday()]
+
+def get_current_time():
+    return datetime.now().strftime("%H:%M")
+
+def format_text_with_variables(text, chat_id=None, order=None, username=None):
+    if not text:
+        return text
+    
+    text = text.replace("{date}", datetime.now().strftime("%d.%m.%Y"))
+    text = text.replace("{time}", datetime.now().strftime("%H:%M"))
+    text = text.replace("{datetime}", datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    
+    if cardinal.account:
+        text = text.replace("{username}", cardinal.account.username if hasattr(cardinal.account, 'username') else "")
+    
+    if username:
+        text = text.replace("{buyer_username}", username)
+    
+    if order:
+        text = text.replace("{order_id}", str(order.id))
+        text = text.replace("{order_price}", str(order.price))
+    
+    return text
+
+def can_send_reply(chat_id):
+    """Проверяет КД"""
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    now = time.time()
+    last_reply = last_reply_time.get(str(chat_id), 0)
+    cooldown = SETTINGS.get("reply_cooldown", 3600)
+    
+    if now - last_reply < cooldown:
+        remaining = int(cooldown - (now - last_reply))
+        logger.debug(f"⏸️ КД для чата {chat_id}: осталось {remaining}с")
+        return False
+    
+    return True
+
+def update_last_reply(chat_id):
+    """Обновляет время последнего ответа"""
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    last_reply_time[str(chat_id)] = time.time()
+    SETTINGS["last_reply_time"] = last_reply_time
+    save_config()
+
+# ============================================
+# 🔄 ОБРАБОТЧИК НОВЫХ СООБЩЕНИЙ (ПРАВИЛЬНЫЙ)
+# ============================================
+
+def message_handler(e):
+    """Обрабатывает новое сообщение через событие NEW_MESSAGE"""
+    
+    if not SETTINGS.get("active", True):
+        return
+    
+    if not SETTINGS.get("auto_reply_enabled", True):
+        return
+    
+    try:
+        # 🔥 ПОЛУЧАЕМ ДАННЫЕ ИЗ СОБЫТИЯ
+        message = getattr(e, 'message', None)
+        if not message:
+            return
+        
+        # Проверяем, что сообщение не от нас
+        if hasattr(message, 'author_id') and message.author_id == cardinal.account.id:
+            return
+        
+        # Проверяем, что это не системное сообщение
+        if getattr(message, 'is_system', False):
+            return
+        
+        chat_id = getattr(message, 'chat_id', None)
+        if not chat_id:
+            return
+        
+        # Проверяем КД
+        if not can_send_reply(chat_id):
+            return
+        
+        msg_text = getattr(message, 'text', '')
+        if not msg_text:
+            return
+        
+        # Получаем имя пользователя
+        username = None
+        if hasattr(message, 'author'):
+            username = message.author
+        elif hasattr(message, 'author_id'):
+            try:
+                # Пробуем получить пользователя
+                user = cardinal.account.get_user(message.author_id)
+                if user:
+                    username = user.name if hasattr(user, 'name') else None
+            except:
+                pass
+        
+        # 🔥 ОТПРАВЛЯЕМ ОТВЕТ С ЗАДЕРЖКОЙ
+        delay = get_delay_seconds()
+        
+        def send_reply():
+            time.sleep(delay)
+            try:
+                # Проверяем КД еще раз
+                if not can_send_reply(chat_id):
+                    return
+                
+                reply_text = SETTINGS.get("reply_message", 
+                    "Здравствуйте! Я сейчас не у экрана. Оставьте ваше сообщение, я отвечу в ближайшее время.")
+                reply_text = format_text_with_variables(reply_text, chat_id, None, username)
+                
+                # 🔥 ПРАВИЛЬНАЯ ОТПРАВКА СООБЩЕНИЯ В ЧАТ
+                cardinal.send_message(chat_id, reply_text)
+                
+                update_last_reply(chat_id)
+                
+                logger.info(f"📤 Отправлен автоответ в чат {chat_id} (задержка {delay}с)")
+                
+                if SETTINGS.get("admin_notify", True):
+                    admin_id = SETTINGS.get("admin_chat_id")
+                    if admin_id:
+                        admin_msg = (
+                            f"💬 **Автоответ отправлен!**\n\n"
+                            f"🆔 Чат: {chat_id}\n"
+                            f"👤 Пользователь: {username or 'Неизвестно'}\n"
+                            f"💬 Сообщение: {msg_text[:50]}...\n"
+                            f"⏱ Задержка: {delay}с\n"
+                            f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                        )
+                        cardinal.send_message(admin_id, admin_msg)
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки ответа: {e}")
+        
+        threading.Thread(target=send_reply, daemon=True).start()
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки сообщения: {e}")
+
+# ============================================
+# 🔄 ПРОВЕРКА ШАБЛОНОВ (ПРАВИЛЬНЫЙ)
+# ============================================
+
+def check_schedule():
+    """Проверяет шаблоны по расписанию"""
+    templates = SETTINGS.get("templates", {})
+    current_time = get_current_time()
+    current_day = get_day_name()
+    
+    for template_id, template in templates.items():
+        try:
+            if not template.get("active", True):
+                continue
+            
+            if template.get("time") != current_time:
+                continue
+            
+            days = template.get("days", [])
+            if days and current_day not in days:
+                continue
+            
+            last_sent = template.get("last_sent")
+            if last_sent:
+                last_date = datetime.fromisoformat(last_sent)
+                if last_date.date() == datetime.now().date():
+                    continue
+            
+            # 🔥 ОТПРАВЛЯЕМ ШАБЛОН
+            message_text = template.get("message", "")
+            if not message_text:
+                continue
+            
+            message_text = format_text_with_variables(message_text)
+            
+            # Получаем все чаты
+            chats = cardinal.account.get_chats()
+            if chats:
+                for chat in chats:
+                    try:
+                        # Не отправляем в заказы
+                        if getattr(chat, 'node_id', None):
+                            continue
+                        cardinal.send_message(chat.id, message_text)
+                        time.sleep(0.5)
+                    except Exception as e:
+                        logger.error(f"❌ Ошибка отправки в чат {chat.id}: {e}")
+            
+            template["last_sent"] = datetime.now().isoformat()
+            save_config()
+            
+            logger.info(f"📤 Отправлен шаблон '{template.get('name', 'Без имени')}'")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка шаблона {template_id}: {e}")
+
+def schedule_worker():
+    """Фоновый поток для проверки расписания"""
+    while True:
+        try:
+            if SETTINGS.get("active", True) and SETTINGS.get("auto_reply_enabled", True):
+                check_schedule()
+            time.sleep(30)
+        except Exception as e:
+            logger.error(f"❌ Ошибка в планировщике: {e}")
+            time.sleep(60)
+
+# ============================================
+# 📱 ИНТЕРФЕЙС
+# ============================================
+
+def show_menu(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('active', True) else '🔴'} Плагин: {'ВКЛ' if SETTINGS.get('active', True) else 'ВЫКЛ'}",
+        callback_data="sar_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('auto_reply_enabled', True) else '🔴'} Автоответы: {'ВКЛ' if SETTINGS.get('auto_reply_enabled', True) else 'ВЫКЛ'}",
+        callback_data="sar_reply_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"⏱ Задержка: {SETTINGS.get('reply_delay', 30)} {SETTINGS.get('reply_delay_unit', 'сек')}",
+        callback_data="sar_delay_settings"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"⏰ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
+        callback_data="sar_cooldown_settings"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"📋 Шаблоны ({len(SETTINGS.get('templates', {}))})",
+        callback_data="sar_templates"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"📝 Сменить текст ответа",
+        callback_data="sar_edit_message"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🔄 Обновить",
+        callback_data="sar_refresh"
+    ))
+    
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    
+    text = (
+        f"💬 **Schedule AutoReply v{VERSION}**\n\n"
+        f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
+        f"📌 **Автоответы:** {'🟢 Включены' if SETTINGS.get('auto_reply_enabled', True) else '🔴 Отключены'}\n"
+        f"⏱ **Задержка:** {SETTINGS.get('reply_delay', 30)} {SETTINGS.get('reply_delay_unit', 'сек')}\n"
+        f"⏰ **КД:** {SETTINGS.get('reply_cooldown', 3600)//60} мин\n"
+        f"📋 **Шаблонов:** {len(SETTINGS.get('templates', {}))}\n"
+        f"💬 **Активных КД:** {len(last_reply_time)}\n\n"
+        f"💬 **Текст ответа:**\n{SETTINGS.get('reply_message', '')[:100]}..."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_delay_settings(message):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🟢 Секунды", callback_data="sar_delay_unit_seconds"),
+        InlineKeyboardButton("🟢 Минуты", callback_data="sar_delay_unit_minutes")
+    )
+    kb.add(
+        InlineKeyboardButton("🟢 Часы", callback_data="sar_delay_unit_hours"),
+        InlineKeyboardButton("🟢 Дни", callback_data="sar_delay_unit_days")
+    )
+    kb.add(
+        InlineKeyboardButton(f"✏️ Значение: {SETTINGS.get('reply_delay', 30)}", callback_data="sar_delay_value")
+    )
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="sar_menu"))
+    
+    current = SETTINGS.get("reply_delay_unit", "seconds")
+    text = (
+        f"⏱ **Настройка задержки**\n\n"
+        f"Текущая задержка: **{SETTINGS.get('reply_delay', 30)} {current}**\n"
+        f"({get_delay_seconds()} секунд)\n\n"
+        f"Выберите единицу измерения или измените значение:"
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_cooldown_settings(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"✏️ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
+        callback_data="sar_cooldown_value"
+    ))
+    kb.add(InlineKeyboardButton(
+        "🔄 Сбросить КД для всех чатов",
+        callback_data="sar_cooldown_reset"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="sar_menu"))
+    
+    text = (
+        f"⏰ **Настройка КД (перезарядки)**\n\n"
+        f"Текущее КД: **{SETTINGS.get('reply_cooldown', 3600)//60} минут**\n"
+        f"({SETTINGS.get('reply_cooldown', 3600)} секунд)\n\n"
+        f"КД — время, которое нужно подождать\n"
+        f"перед следующим ответом в том же чате."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_templates(message):
+    templates = SETTINGS.get("templates", {})
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    
+    if templates:
+        text = "📋 **Ваши шаблоны:**\n\n"
+        for template_id, template in sorted(templates.items(), key=lambda x: int(x[0])):
+            status = "🟢" if template.get("active", True) else "🔴"
+            days = ", ".join(template.get("days", ["ежедневно"])) if template.get("days") else "ежедневно"
+            text += f"{status} **{template.get('name', 'Без имени')}**\n"
+            text += f"   ⏰ {template.get('time', 'Не указано')} | 📅 {days}\n"
+            text += f"   💬 {template.get('message', '')[:50]}...\n\n"
+            
+            kb.add(InlineKeyboardButton(
+                f"✏️ {template.get('name', 'Без имени')}",
+                callback_data=f"sar_edit_template_{template_id}"
+            ))
+    else:
+        text = "📋 **У вас нет шаблонов**\n\nНажмите '➕ Добавить шаблон' чтобы создать первый"
+    
+    kb.add(InlineKeyboardButton("➕ Добавить шаблон", callback_data="sar_add_template"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="sar_menu"))
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_template_edit(message, template_id):
+    templates = SETTINGS.get("templates", {})
+    template = templates.get(template_id, {})
+    
+    if not template:
+        bot.send_message(message.chat.id, "❌ Шаблон не найден")
+        show_templates(message)
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if template.get('active', True) else '🔴'} Статус",
+        callback_data=f"sar_template_toggle_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"✏️ Название: {template.get('name', 'Без имени')}",
+        callback_data=f"sar_template_name_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"⏰ Время: {template.get('time', 'Не указано')}",
+        callback_data=f"sar_template_time_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"📅 Дни: {', '.join(template.get('days', ['ежедневно']))[:20]}",
+        callback_data=f"sar_template_days_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"💬 Изменить текст",
+        callback_data=f"sar_template_message_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🗑️ Удалить шаблон",
+        callback_data=f"sar_template_delete_{template_id}"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="sar_templates"))
+    
+    days = ", ".join(template.get("days", ["ежедневно"])) if template.get("days") else "ежедневно"
+    
+    text = (
+        f"✏️ **Редактирование шаблона**\n\n"
+        f"📌 **Название:** {template.get('name', 'Без имени')}\n"
+        f"📌 **Статус:** {'🟢 Активен' if template.get('active', True) else '🔴 Неактивен'}\n"
+        f"⏰ **Время:** {template.get('time', 'Не указано')}\n"
+        f"📅 **Дни:** {days}\n"
+        f"💬 **Текст:**\n{template.get('message', 'Не указан')[:200]}..."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+# ============================================
+# 🚀 ИНИЦИАЛИЗАЦИЯ
+# ============================================
+
+def init_plugin(c):
+    global cardinal, tg, bot, schedule_counter
+    cardinal = c
+    tg = c.telegram
+    bot = c.telegram.bot
+    
+    print("=" * 50)
+    print("[SAR] 💬 ЗАГРУЗКА Schedule AutoReply v2.2")
+    print("[SAR] 🔄 Исправленная версия для Cardinal")
+    print("=" * 50)
+    
+    load_config()
+    
+    c.add_telegram_commands(UUID, [
+        ("sar", "💬 Автоответы по расписанию", True),
+        ("sar_schedule", "📋 Показать шаблоны", True)
+    ])
+    tg.msg_handler(show_menu, commands=["sar"])
+    tg.msg_handler(show_templates, commands=["sar_schedule"])
+    
+    # 🔥 РЕГИСТРАЦИЯ ОБРАБОТЧИКА СООБЩЕНИЙ
+    def new_message_wrapper(e):
+        message_handler(e)
+    
+    # 🔥 РЕГИСТРИРУЕМ ОБРАБОТЧИК НА НОВЫЕ СООБЩЕНИЯ
+    BIND_TO_NEW_MESSAGE = [new_message_wrapper]
+    
+    # 🔥 ЗАПУСКАЕМ ПЛАНИРОВЩИК ДЛЯ ШАБЛОНОВ
+    schedule_thread = threading.Thread(target=schedule_worker, daemon=True)
+    schedule_thread.start()
+    logger.info("🔄 Планировщик запущен")
+    
+    # Обработчики ввода
+    def handle_input(message):
+        state = tg.get_state(message.chat.id, message.from_user.id)
+        if not state:
+            return
+        
+        action = state.get("action")
+        data = state.get("data", {})
+        template_id = data.get("template_id")
+        
+        if action == "sar_edit_message":
+            SETTINGS["reply_message"] = message.text.strip()
+            save_config()
+            bot.reply_to(message, "✅ Текст ответа обновлён!")
+            show_menu(message)
+        
+        elif action == "sar_delay_value":
+            try:
+                value = int(message.text.strip())
+                if value >= 0:
+                    SETTINGS["reply_delay"] = value
+                    save_config()
+                    bot.reply_to(message, f"✅ Задержка установлена: {value} {SETTINGS.get('reply_delay_unit', 'сек')}")
+                else:
+                    bot.reply_to(message, "❌ Введите положительное число!")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число!")
+            show_delay_settings(message)
+        
+        elif action == "sar_cooldown_value":
+            try:
+                value = int(message.text.strip())
+                if value >= 0:
+                    SETTINGS["reply_cooldown"] = value
+                    save_config()
+                    bot.reply_to(message, f"✅ КД установлено: {value} секунд ({value//60} мин)")
+                else:
+                    bot.reply_to(message, "❌ Введите положительное число!")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число!")
+            show_cooldown_settings(message)
+        
+        elif action == "sar_add_template_name":
+            name = message.text.strip()
+            if name:
+                templates = SETTINGS.get("templates", {})
+                new_id = str(schedule_counter)
+                templates[new_id] = {
+                    "name": name,
+                    "time": "08:00",
+                    "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                    "message": "Введите текст сообщения",
+                    "active": True,
+                    "last_sent": None
+                }
+                SETTINGS["templates"] = templates
+                schedule_counter += 1
+                save_config()
+                bot.reply_to(message, f"✅ Шаблон '{name}' создан!")
+                show_templates(message)
+            else:
+                bot.reply_to(message, "❌ Введите название!")
+        
+        elif action == "sar_template_name":
+            new_name = message.text.strip()
+            if new_name and template_id:
+                templates = SETTINGS.get("templates", {})
+                if template_id in templates:
+                    templates[template_id]["name"] = new_name
+                    save_config()
+                    bot.reply_to(message, f"✅ Название обновлено!")
+                show_template_edit(message, template_id)
+        
+        elif action == "sar_template_time":
+            time_str = message.text.strip()
+            if re.match(r'^\d{2}:\d{2}$', time_str) and template_id:
+                templates = SETTINGS.get("templates", {})
+                if template_id in templates:
+                    templates[template_id]["time"] = time_str
+                    save_config()
+                    bot.reply_to(message, f"✅ Время обновлено: {time_str}")
+                show_template_edit(message, template_id)
+            else:
+                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
+        
+        elif action == "sar_template_message":
+            new_message = message.text.strip()
+            if new_message and template_id:
+                templates = SETTINGS.get("templates", {})
+                if template_id in templates:
+                    templates[template_id]["message"] = new_message
+                    save_config()
+                    bot.reply_to(message, f"✅ Текст обновлён!")
+                show_template_edit(message, template_id)
+        
+        elif action == "sar_template_days":
+            days_input = message.text.strip().lower()
+            if template_id:
+                if days_input:
+                    days = [d.strip() for d in days_input.split(",")]
+                    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                    valid_input = [d for d in days if d in valid_days]
+                    if valid_input:
+                        templates = SETTINGS.get("templates", {})
+                        if template_id in templates:
+                            templates[template_id]["days"] = valid_input
+                            save_config()
+                            bot.reply_to(message, f"✅ Дни обновлены: {', '.join(valid_input)}")
+                    else:
+                        bot.reply_to(message, "❌ Введите дни на английском через запятую")
+                else:
+                    templates = SETTINGS.get("templates", {})
+                    if template_id in templates:
+                        templates[template_id]["days"] = []
+                        save_config()
+                        bot.reply_to(message, "✅ Дни обновлены: ежедневно")
+                show_template_edit(message, template_id)
+        
+        tg.clear_state(message.chat.id, message.from_user.id)
+    
+    tg.msg_handler(handle_input, func=lambda m: tg.check_state(m.chat.id, m.from_user.id))
+    
+    # 🔥 КОЛБЭКИ
+    def toggle_cb(call):
+        SETTINGS["active"] = not SETTINGS.get("active", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
+        show_menu(call.message)
+    
+    def reply_toggle_cb(call):
+        SETTINGS["auto_reply_enabled"] = not SETTINGS.get("auto_reply_enabled", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['auto_reply_enabled'] else 'OFF'}")
+        show_menu(call.message)
+    
+    def refresh_cb(call):
+        bot.answer_callback_query(call.id, "🔄 Обновлено")
+        show_menu(call.message)
+    
+    def show_templates_cb(call):
+        bot.answer_callback_query(call.id)
+        show_templates(call.message)
+    
+    def menu_cb(call):
+        bot.answer_callback_query(call.id)
+        show_menu(call.message)
+    
+    def edit_message_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "📝 Введите новый текст для автоответа:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_edit_message")
+    
+    def delay_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_delay_settings(call.message)
+    
+    def delay_unit_cb(call):
+        unit = call.data.replace("sar_delay_unit_", "")
+        SETTINGS["reply_delay_unit"] = unit
+        save_config()
+        bot.answer_callback_query(call.id, f"Единица: {unit}")
+        show_delay_settings(call.message)
+    
+    def delay_value_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, f"✏️ Введите значение задержки (в {SETTINGS.get('reply_delay_unit', 'сек')}):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_delay_value")
+    
+    def cooldown_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_cooldown_settings(call.message)
+    
+    def cooldown_value_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "✏️ Введите КД в секундах (например: 3600 = 1 час):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_cooldown_value")
+    
+    def cooldown_reset_cb(call):
+        SETTINGS["last_reply_time"] = {}
+        save_config()
+        bot.answer_callback_query(call.id, "✅ КД сброшен для всех чатов!")
+        show_cooldown_settings(call.message)
+    
+    def add_template_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "📝 Введите название нового шаблона:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_add_template_name")
+    
+    def edit_template_cb(call):
+        template_id = call.data.replace("sar_edit_template_", "")
+        bot.answer_callback_query(call.id)
+        show_template_edit(call.message, template_id)
+    
+    def template_toggle_cb(call):
+        template_id = call.data.replace("sar_template_toggle_", "")
+        templates = SETTINGS.get("templates", {})
+        if template_id in templates:
+            templates[template_id]["active"] = not templates[template_id].get("active", True)
+            save_config()
+            bot.answer_callback_query(call.id, f"{'ON' if templates[template_id]['active'] else 'OFF'}")
+        show_template_edit(call.message, template_id)
+    
+    def template_name_cb(call):
+        template_id = call.data.replace("sar_template_name_", "")
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "✏️ Введите новое название шаблона:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_template_name", {"template_id": template_id})
+    
+    def template_time_cb(call):
+        template_id = call.data.replace("sar_template_time_", "")
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "⏰ Введите новое время (HH:MM):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_template_time", {"template_id": template_id})
+    
+    def template_days_cb(call):
+        template_id = call.data.replace("sar_template_days_", "")
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "📅 Введите дни недели через запятую (monday, tuesday...):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_template_days", {"template_id": template_id})
+    
+    def template_message_cb(call):
+        template_id = call.data.replace("sar_template_message_", "")
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "💬 Введите новый текст для шаблона:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_template_message", {"template_id": template_id})
+    
+    def template_delete_cb(call):
+        template_id = call.data.replace("sar_template_delete_", "")
+        templates = SETTINGS.get("templates", {})
+        if template_id in templates:
+            del templates[template_id]
+            save_config()
+            bot.answer_callback_query(call.id, "🗑️ Шаблон удалён!")
+        show_templates(call.message)
+    
+    tg.cbq_handler(toggle_cb, lambda call: call.data == "sar_toggle")
+    tg.cbq_handler(reply_toggle_cb, lambda call: call.data == "sar_reply_toggle")
+    tg.cbq_handler(refresh_cb, lambda call: call.data == "sar_refresh")
+    tg.cbq_handler(show_templates_cb, lambda call: call.data == "sar_templates")
+    tg.cbq_handler(menu_cb, lambda call: call.data == "sar_menu")
+    tg.cbq_handler(edit_message_cb, lambda call: call.data == "sar_edit_message")
+    tg.cbq_handler(delay_settings_cb, lambda call: call.data == "sar_delay_settings")
+    tg.cbq_handler(delay_unit_cb, lambda call: call.data.startswith("sar_delay_unit_"))
+    tg.cbq_handler(delay_value_cb, lambda call: call.data == "sar_delay_value")
+    tg.cbq_handler(cooldown_settings_cb, lambda call: call.data == "sar_cooldown_settings")
+    tg.cbq_handler(cooldown_value_cb, lambda call: call.data == "sar_cooldown_value")
+    tg.cbq_handler(cooldown_reset_cb, lambda call: call.data == "sar_cooldown_reset")
+    tg.cbq_handler(add_template_cb, lambda call: call.data == "sar_add_template")
+    tg.cbq_handler(edit_template_cb, lambda call: call.data.startswith("sar_edit_template_"))
+    tg.cbq_handler(template_toggle_cb, lambda call: call.data.startswith("sar_template_toggle_"))
+    tg.cbq_handler(template_name_cb, lambda call: call.data.startswith("sar_template_name_"))
+    tg.cbq_handler(template_time_cb, lambda call: call.data.startswith("sar_template_time_"))
+    tg.cbq_handler(template_days_cb, lambda call: call.data.startswith("sar_template_days_"))
+    tg.cbq_handler(template_message_cb, lambda call: call.data.startswith("sar_template_message_"))
+    tg.cbq_handler(template_delete_cb, lambda call: call.data.startswith("sar_template_delete_"))
+    
+    print("[SAR] ✅ Плагин загружен!")
+    print("[SAR] 📌 /sar — меню настроек")
+    print("[SAR] 📌 /sar_schedule — показать шаблоны")
+    print("[SAR] 🔄 Обработчик NEW_MESSAGE зарегистрирован")
+    print("=" * 50)
+
+# ============================================
+# 🔗 ТОЧКИ ВХОДА
+# ============================================
+
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_NEW_MESSAGE = [message_handler]
+BIND_TO_DELETE = None
