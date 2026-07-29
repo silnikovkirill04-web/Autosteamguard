@@ -1,1 +1,472 @@
+"""
+Schedule AutoReply — Автоответы по расписанию
+Отвечает на ЛЮБОЕ сообщение с задержкой и КД
+Правильная архитектура для Cardinal
+"""
+import uuid as uuid_lib
+import json
+import os
+import re
+import time
+import threading
+import logging
+from datetime import datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+NAME = "Schedule AutoReply"
+VERSION = "2.3.0"
+DESCRIPTION = "Автоответы с настраиваемой задержкой и КД"
+CREDITS = "@qneiz"
+UUID = str(uuid_lib.uuid4())
+SETTINGS_PAGE = True
+
+CONFIG_PATH = "storage/cache/schedule_autoreply.json"
+LOG_PATH = "storage/cache/schedule_autoreply.log"
+
+cardinal = None
+tg = None
+bot = None
+
+# 🔥 Логгер
+logger = logging.getLogger("ScheduleAutoReply")
+logger.setLevel(logging.INFO)
+
+try:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+except:
+    pass
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
+# 🔥 НАСТРОЙКИ
+DEFAULT_SETTINGS = {
+    "active": True,
+    "auto_reply_enabled": True,
+    "reply_delay": 30,
+    "reply_delay_unit": "seconds",
+    "reply_cooldown": 3600,
+    "admin_notify": True,
+    "reply_message": "Здравствуйте! Я сейчас не у экрана. Оставьте ваше сообщение, я отвечу в ближайшее время.",
+    "last_reply_time": {},  # {chat_id: timestamp}
+}
+
+SETTINGS = DEFAULT_SETTINGS.copy()
+
+# ============================================
+# 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
+# ============================================
+
+def load_config():
+    global SETTINGS
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                for k in loaded:
+                    if k in SETTINGS:
+                        SETTINGS[k] = loaded[k]
+        else:
+            save_config()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки конфига: {e}")
+        save_config()
+
+def save_config():
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+
+def get_delay_seconds():
+    delay = SETTINGS.get("reply_delay", 30)
+    unit = SETTINGS.get("reply_delay_unit", "seconds")
+    
+    if unit == "seconds":
+        return delay
+    elif unit == "minutes":
+        return delay * 60
+    elif unit == "hours":
+        return delay * 3600
+    elif unit == "days":
+        return delay * 86400
+    else:
+        return delay
+
+def format_text_with_variables(text, chat_id=None, username=None):
+    if not text:
+        return text
+    
+    text = text.replace("{date}", datetime.now().strftime("%d.%m.%Y"))
+    text = text.replace("{time}", datetime.now().strftime("%H:%M"))
+    text = text.replace("{datetime}", datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    
+    if cardinal.account:
+        username_acc = cardinal.account.username if hasattr(cardinal.account, 'username') else ""
+        text = text.replace("{username}", username_acc)
+    
+    if username:
+        text = text.replace("{buyer_username}", username)
+    
+    return text
+
+def can_send_reply(chat_id):
+    """Проверяет КД"""
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    now = time.time()
+    last_reply = last_reply_time.get(str(chat_id), 0)
+    cooldown = SETTINGS.get("reply_cooldown", 3600)
+    
+    if now - last_reply < cooldown:
+        remaining = int(cooldown - (now - last_reply))
+        logger.debug(f"⏸️ КД для чата {chat_id}: осталось {remaining}с")
+        return False
+    
+    return True
+
+def update_last_reply(chat_id):
+    """Обновляет время последнего ответа"""
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    last_reply_time[str(chat_id)] = time.time()
+    SETTINGS["last_reply_time"] = last_reply_time
+    save_config()
+
+# ============================================
+# 🔄 ОБРАБОТЧИК НОВЫХ СООБЩЕНИЙ (ПРАВИЛЬНЫЙ)
+# ============================================
+
+def message_handler(msg_obj):
+    """
+    Обрабатывает новое сообщение через хук BIND_TO_NEW_MESSAGE
+    msg_obj — это объект нового сообщения из ядра Cardinal
+    """
+    
+    if not SETTINGS.get("active", True):
+        return
+    
+    if not SETTINGS.get("auto_reply_enabled", True):
+        return
+    
+    try:
+        # 🔥 ПРОВЕРЯЕМ, ЧТО СООБЩЕНИЕ НЕ ОТ НАС
+        if getattr(msg_obj, "is_employee", False):
+            return
+        
+        # 🔥 ПОЛУЧАЕМ CHAT_ID
+        chat_id = getattr(msg_obj, "chat_id", None) or getattr(msg_obj, "node_id", None)
+        if not chat_id:
+            return
+        
+        # 🔥 ПРОВЕРЯЕМ КД
+        if not can_send_reply(chat_id):
+            return
+        
+        # 🔥 ПОЛУЧАЕМ ТЕКСТ СООБЩЕНИЯ
+        msg_text = getattr(msg_obj, "text", "")
+        if not msg_text:
+            return
+        
+        # 🔥 ПОЛУЧАЕМ ИМЯ ПОКУПАТЕЛЯ
+        username = None
+        if hasattr(msg_obj, "author"):
+            username = msg_obj.author
+        elif hasattr(msg_obj, "user_name"):
+            username = msg_obj.user_name
+        
+        # 🔥 ОТПРАВЛЯЕМ ОТВЕТ С ЗАДЕРЖКОЙ
+        delay = get_delay_seconds()
+        
+        def send_reply():
+            time.sleep(delay)
+            try:
+                # Проверяем КД еще раз
+                if not can_send_reply(chat_id):
+                    return
+                
+                reply_text = SETTINGS.get("reply_message", 
+                    "Здравствуйте! Я сейчас не у экрана. Оставьте ваше сообщение, я отвечу в ближайшее время.")
+                reply_text = format_text_with_variables(reply_text, chat_id, username)
+                
+                # 🔥 ПРАВИЛЬНАЯ ОТПРАВКА В ЧАТ FunPay
+                # Используем account.send_message для отправки в чат FunPay
+                if hasattr(cardinal.account, 'send_message'):
+                    cardinal.account.send_message(chat_id, reply_text)
+                elif hasattr(cardinal, 'send_order_message'):
+                    cardinal.send_order_message(chat_id, reply_text)
+                else:
+                    # Fallback — отправляем через основной метод
+                    cardinal.send_message(chat_id, reply_text)
+                
+                update_last_reply(chat_id)
+                
+                logger.info(f"📤 Отправлен автоответ в чат {chat_id} (задержка {delay}с)")
+                
+                if SETTINGS.get("admin_notify", True):
+                    admin_id = SETTINGS.get("admin_chat_id")
+                    if admin_id:
+                        admin_msg = (
+                            f"💬 **Автоответ отправлен!**\n\n"
+                            f"🆔 Чат: {chat_id}\n"
+                            f"👤 Пользователь: {username or 'Неизвестно'}\n"
+                            f"💬 Сообщение: {msg_text[:50]}...\n"
+                            f"⏱ Задержка: {delay}с\n"
+                            f"📅 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                        )
+                        cardinal.send_message(admin_id, admin_msg)
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки ответа: {e}")
+        
+        threading.Thread(target=send_reply, daemon=True).start()
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки сообщения: {e}")
+
+# ============================================
+# 📱 ИНТЕРФЕЙС
+# ============================================
+
+def show_menu(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('active', True) else '🔴'} Плагин: {'ВКЛ' if SETTINGS.get('active', True) else 'ВЫКЛ'}",
+        callback_data="sar_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('auto_reply_enabled', True) else '🔴'} Автоответы: {'ВКЛ' if SETTINGS.get('auto_reply_enabled', True) else 'ВЫКЛ'}",
+        callback_data="sar_reply_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"⏱ Задержка: {SETTINGS.get('reply_delay', 30)} {SETTINGS.get('reply_delay_unit', 'сек')}",
+        callback_data="sar_delay_settings"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"⏰ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
+        callback_data="sar_cooldown_settings"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"📝 Сменить текст ответа",
+        callback_data="sar_edit_message"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🔄 Обновить",
+        callback_data="sar_refresh"
+    ))
+    
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    
+    text = (
+        f"💬 **Schedule AutoReply v{VERSION}**\n\n"
+        f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
+        f"📌 **Автоответы:** {'🟢 Включены' if SETTINGS.get('auto_reply_enabled', True) else '🔴 Отключены'}\n"
+        f"⏱ **Задержка:** {SETTINGS.get('reply_delay', 30)} {SETTINGS.get('reply_delay_unit', 'сек')}\n"
+        f"⏰ **КД:** {SETTINGS.get('reply_cooldown', 3600)//60} мин\n"
+        f"💬 **Активных КД:** {len(last_reply_time)}\n\n"
+        f"💬 **Текст ответа:**\n{SETTINGS.get('reply_message', '')[:100]}..."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_delay_settings(message):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🟢 Секунды", callback_data="sar_delay_unit_seconds"),
+        InlineKeyboardButton("🟢 Минуты", callback_data="sar_delay_unit_minutes")
+    )
+    kb.add(
+        InlineKeyboardButton("🟢 Часы", callback_data="sar_delay_unit_hours"),
+        InlineKeyboardButton("🟢 Дни", callback_data="sar_delay_unit_days")
+    )
+    kb.add(
+        InlineKeyboardButton(f"✏️ Значение: {SETTINGS.get('reply_delay', 30)}", callback_data="sar_delay_value")
+    )
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="sar_menu"))
+    
+    current = SETTINGS.get("reply_delay_unit", "seconds")
+    text = (
+        f"⏱ **Настройка задержки**\n\n"
+        f"Текущая задержка: **{SETTINGS.get('reply_delay', 30)} {current}**\n"
+        f"({get_delay_seconds()} секунд)\n\n"
+        f"Выберите единицу измерения или измените значение:"
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_cooldown_settings(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"✏️ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
+        callback_data="sar_cooldown_value"
+    ))
+    kb.add(InlineKeyboardButton(
+        "🔄 Сбросить КД для всех чатов",
+        callback_data="sar_cooldown_reset"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="sar_menu"))
+    
+    text = (
+        f"⏰ **Настройка КД (перезарядки)**\n\n"
+        f"Текущее КД: **{SETTINGS.get('reply_cooldown', 3600)//60} минут**\n"
+        f"({SETTINGS.get('reply_cooldown', 3600)} секунд)\n\n"
+        f"КД — время, которое нужно подождать\n"
+        f"перед следующим ответом в том же чате."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+# ============================================
+# 🚀 ИНИЦИАЛИЗАЦИЯ
+# ============================================
+
+def init_plugin(c):
+    global cardinal, tg, bot
+    cardinal = c
+    tg = c.telegram
+    bot = c.telegram.bot
+    
+    print("=" * 50)
+    print("[SAR] 💬 ЗАГРУЗКА Schedule AutoReply v2.3")
+    print("[SAR] 🔄 Правильная архитектура для Cardinal")
+    print("=" * 50)
+    
+    load_config()
+    
+    c.add_telegram_commands(UUID, [
+        ("sar", "💬 Автоответы по расписанию", True)
+    ])
+    tg.msg_handler(show_menu, commands=["sar"])
+    
+    # Обработчики ввода
+    def handle_input(message):
+        state = tg.get_state(message.chat.id, message.from_user.id)
+        if not state:
+            return
+        
+        action = state.get("action")
+        
+        if action == "sar_edit_message":
+            SETTINGS["reply_message"] = message.text.strip()
+            save_config()
+            bot.reply_to(message, "✅ Текст ответа обновлён!")
+            show_menu(message)
+        
+        elif action == "sar_delay_value":
+            try:
+                value = int(message.text.strip())
+                if value >= 0:
+                    SETTINGS["reply_delay"] = value
+                    save_config()
+                    bot.reply_to(message, f"✅ Задержка установлена: {value} {SETTINGS.get('reply_delay_unit', 'сек')}")
+                else:
+                    bot.reply_to(message, "❌ Введите положительное число!")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число!")
+            show_delay_settings(message)
+        
+        elif action == "sar_cooldown_value":
+            try:
+                value = int(message.text.strip())
+                if value >= 0:
+                    SETTINGS["reply_cooldown"] = value
+                    save_config()
+                    bot.reply_to(message, f"✅ КД установлено: {value} секунд ({value//60} мин)")
+                else:
+                    bot.reply_to(message, "❌ Введите положительное число!")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число!")
+            show_cooldown_settings(message)
+        
+        tg.clear_state(message.chat.id, message.from_user.id)
+    
+    tg.msg_handler(handle_input, func=lambda m: tg.check_state(m.chat.id, m.from_user.id))
+    
+    # 🔥 КОЛБЭКИ
+    def toggle_cb(call):
+        SETTINGS["active"] = not SETTINGS.get("active", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
+        show_menu(call.message)
+    
+    def reply_toggle_cb(call):
+        SETTINGS["auto_reply_enabled"] = not SETTINGS.get("auto_reply_enabled", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['auto_reply_enabled'] else 'OFF'}")
+        show_menu(call.message)
+    
+    def refresh_cb(call):
+        bot.answer_callback_query(call.id, "🔄 Обновлено")
+        show_menu(call.message)
+    
+    def menu_cb(call):
+        bot.answer_callback_query(call.id)
+        show_menu(call.message)
+    
+    def edit_message_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "📝 Введите новый текст для автоответа:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_edit_message")
+    
+    def delay_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_delay_settings(call.message)
+    
+    def delay_unit_cb(call):
+        unit = call.data.replace("sar_delay_unit_", "")
+        SETTINGS["reply_delay_unit"] = unit
+        save_config()
+        bot.answer_callback_query(call.id, f"Единица: {unit}")
+        show_delay_settings(call.message)
+    
+    def delay_value_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, f"✏️ Введите значение задержки (в {SETTINGS.get('reply_delay_unit', 'сек')}):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_delay_value")
+    
+    def cooldown_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_cooldown_settings(call.message)
+    
+    def cooldown_value_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "✏️ Введите КД в секундах (например: 3600 = 1 час):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "sar_cooldown_value")
+    
+    def cooldown_reset_cb(call):
+        SETTINGS["last_reply_time"] = {}
+        save_config()
+        bot.answer_callback_query(call.id, "✅ КД сброшен для всех чатов!")
+        show_cooldown_settings(call.message)
+    
+    tg.cbq_handler(toggle_cb, lambda call: call.data == "sar_toggle")
+    tg.cbq_handler(reply_toggle_cb, lambda call: call.data == "sar_reply_toggle")
+    tg.cbq_handler(refresh_cb, lambda call: call.data == "sar_refresh")
+    tg.cbq_handler(menu_cb, lambda call: call.data == "sar_menu")
+    tg.cbq_handler(edit_message_cb, lambda call: call.data == "sar_edit_message")
+    tg.cbq_handler(delay_settings_cb, lambda call: call.data == "sar_delay_settings")
+    tg.cbq_handler(delay_unit_cb, lambda call: call.data.startswith("sar_delay_unit_"))
+    tg.cbq_handler(delay_value_cb, lambda call: call.data == "sar_delay_value")
+    tg.cbq_handler(cooldown_settings_cb, lambda call: call.data == "sar_cooldown_settings")
+    tg.cbq_handler(cooldown_value_cb, lambda call: call.data == "sar_cooldown_value")
+    tg.cbq_handler(cooldown_reset_cb, lambda call: call.data == "sar_cooldown_reset")
+    
+    print("[SAR] ✅ Плагин загружен!")
+    print("[SAR] 📌 /sar — меню настроек")
+    print("[SAR] 🔄 Обработчик BIND_TO_NEW_MESSAGE зарегистрирован")
+    print("=" * 50)
+
+# ============================================
+# 🔗 ТОЧКИ ВХОДА
+# ============================================
+
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_NEW_MESSAGE = [message_handler]
+BIND_TO_DELETE = None
