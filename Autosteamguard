@@ -1,1 +1,458 @@
 
+"""
+AutoReply — Автоответы с КД
+Отвечает на ЛЮБОЕ сообщение с настраиваемым КД
+Работает только в ночное время (22:30 - 7:59)
+"""
+import uuid as uuid_lib
+import json
+import os
+import re
+import time
+import threading
+import logging
+from datetime import datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+NAME = "AutoReply"
+VERSION = "2.6.0"
+DESCRIPTION = "Автоответы в ночное время (22:30 - 7:59)"
+CREDITS = "@qneiz"
+UUID = str(uuid_lib.uuid4())
+SETTINGS_PAGE = True
+
+CONFIG_PATH = "storage/cache/autoreply.json"
+LOG_PATH = "storage/cache/autoreply.log"
+
+cardinal = None
+tg = None
+bot = None
+
+# 🔥 Логгер
+logger = logging.getLogger("AutoReply")
+logger.setLevel(logging.INFO)
+
+try:
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+except:
+    pass
+
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+console_handler.setFormatter(console_formatter)
+logger.addHandler(console_handler)
+
+# 🔥 НАСТРОЙКИ
+DEFAULT_SETTINGS = {
+    "active": True,
+    "auto_reply_enabled": True,
+    "reply_cooldown": 3600,
+    "admin_notify": True,
+    "reply_message": "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.",
+    "work_start": "22:30",
+    "work_end": "07:59",
+    "last_reply_time": {},
+}
+
+SETTINGS = DEFAULT_SETTINGS.copy()
+
+# ============================================
+# 🔧 СЛУЖЕБНЫЕ ФУНКЦИИ
+# ============================================
+
+def load_config():
+    global SETTINGS
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                for k in loaded:
+                    if k in SETTINGS:
+                        SETTINGS[k] = loaded[k]
+        else:
+            save_config()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки конфига: {e}")
+        save_config()
+
+def save_config():
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(SETTINGS, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+
+def is_night_time():
+    """Проверяет, сейчас ночное время (22:30 - 7:59)"""
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    
+    start = SETTINGS.get("work_start", "22:30")
+    end = SETTINGS.get("work_end", "07:59")
+    
+    if current_time >= start and current_time <= "23:59":
+        return True
+    if current_time >= "00:00" and current_time <= end:
+        return True
+    
+    return False
+
+def format_text_with_variables(text, username=None):
+    if not text:
+        return text
+    
+    text = text.replace("{date}", datetime.now().strftime("%d.%m.%Y"))
+    text = text.replace("{time}", datetime.now().strftime("%H:%M"))
+    text = text.replace("{datetime}", datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    
+    if cardinal.account:
+        username_acc = cardinal.account.username if hasattr(cardinal.account, 'username') else ""
+        text = text.replace("{username}", username_acc)
+    
+    if username:
+        text = text.replace("{buyer_username}", username)
+    
+    return text
+
+def can_send_reply(chat_id):
+    """Проверяет КД"""
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    now = time.time()
+    last_reply = last_reply_time.get(str(chat_id), 0)
+    cooldown = SETTINGS.get("reply_cooldown", 3600)
+    
+    if now - last_reply < cooldown:
+        remaining = int(cooldown - (now - last_reply))
+        logger.debug(f"⏸️ КД для чата {chat_id}: осталось {remaining}с")
+        return False
+    
+    return True
+
+def update_last_reply(chat_id):
+    """Обновляет время последнего ответа"""
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    last_reply_time[str(chat_id)] = time.time()
+    SETTINGS["last_reply_time"] = last_reply_time
+    save_config()
+
+# ============================================
+# 🔄 ОБРАБОТЧИК СООБЩЕНИЙ
+# ============================================
+
+def message_handler(msg_obj):
+    """Обрабатывает новое сообщение через хук BIND_TO_NEW_MESSAGE"""
+    
+    if not SETTINGS.get("active", True):
+        return
+    
+    if not SETTINGS.get("auto_reply_enabled", True):
+        return
+    
+    # Проверка: работаем только в ночное время
+    if not is_night_time():
+        return
+    
+    try:
+        # Проверяем, что сообщение не от нас
+        if getattr(msg_obj, "is_employee", False):
+            return
+        
+        # Получаем chat_id
+        chat_id = getattr(msg_obj, "chat_id", None) or getattr(msg_obj, "node_id", None)
+        if not chat_id:
+            return
+        
+        # Проверяем КД
+        if not can_send_reply(chat_id):
+            return
+        
+        # Получаем имя покупателя
+        username = None
+        if hasattr(msg_obj, "author"):
+            username = msg_obj.author
+        elif hasattr(msg_obj, "user_name"):
+            username = msg_obj.user_name
+        
+        # Отправляем ответ (без задержки)
+        try:
+            reply_text = SETTINGS.get("reply_message", 
+                "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.")
+            reply_text = format_text_with_variables(reply_text, username)
+            
+            # Отправка в чат FunPay
+            if hasattr(cardinal.account, 'send_message'):
+                cardinal.account.send_message(chat_id, reply_text)
+            else:
+                cardinal.send_message(chat_id, reply_text)
+            
+            update_last_reply(chat_id)
+            
+            logger.info(f"📤 Отправлен ночной автоответ в чат {chat_id}")
+            
+            if SETTINGS.get("admin_notify", True):
+                admin_id = SETTINGS.get("admin_chat_id")
+                if admin_id:
+                    admin_msg = (
+                        f"💬 **Ночной автоответ отправлен!**\n\n"
+                        f"🆔 Чат: {chat_id}\n"
+                        f"👤 Пользователь: {username or 'Неизвестно'}\n"
+                        f"🌙 Время: {datetime.now().strftime('%H:%M')}\n"
+                        f"📅 Дата: {datetime.now().strftime('%d.%m.%Y')}"
+                    )
+                    cardinal.send_message(admin_id, admin_msg)
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки ответа: {e}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки сообщения: {e}")
+
+# ============================================
+# 📱 ИНТЕРФЕЙС
+# ============================================
+
+def show_menu(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('active', True) else '🔴'} Плагин: {'ВКЛ' if SETTINGS.get('active', True) else 'ВЫКЛ'}",
+        callback_data="ar_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"{'🟢' if SETTINGS.get('auto_reply_enabled', True) else '🔴'} Автоответы: {'ВКЛ' if SETTINGS.get('auto_reply_enabled', True) else 'ВЫКЛ'}",
+        callback_data="ar_reply_toggle"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"⏰ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
+        callback_data="ar_cooldown_settings"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🌙 Ночной режим: {SETTINGS.get('work_start', '22:30')} - {SETTINGS.get('work_end', '07:59')}",
+        callback_data="ar_time_settings"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"📝 Сменить текст ответа",
+        callback_data="ar_edit_message"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"🔄 Обновить",
+        callback_data="ar_refresh"
+    ))
+    
+    last_reply_time = SETTINGS.get("last_reply_time", {})
+    night_active = "🟢 Активен" if is_night_time() else "🔴 Неактивен"
+    
+    text = (
+        f"💬 **AutoReply v{VERSION}**\n\n"
+        f"📌 **Статус:** {'🟢 Активен' if SETTINGS.get('active', True) else '🔴 Отключён'}\n"
+        f"📌 **Автоответы:** {'🟢 Включены' if SETTINGS.get('auto_reply_enabled', True) else '🔴 Отключены'}\n"
+        f"🌙 **Ночной режим:** {night_active}\n"
+        f"⏰ **Время работы:** {SETTINGS.get('work_start', '22:30')} - {SETTINGS.get('work_end', '07:59')}\n"
+        f"⏰ **КД:** {SETTINGS.get('reply_cooldown', 3600)//60} мин\n"
+        f"💬 **Активных КД:** {len(last_reply_time)}\n\n"
+        f"💬 **Текст ответа:**\n{SETTINGS.get('reply_message', '')[:100]}..."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_time_settings(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"✏️ Начало: {SETTINGS.get('work_start', '22:30')}",
+        callback_data="ar_time_start"
+    ))
+    kb.add(InlineKeyboardButton(
+        f"✏️ Конец: {SETTINGS.get('work_end', '07:59')}",
+        callback_data="ar_time_end"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_menu"))
+    
+    text = (
+        f"🌙 **Настройка ночного режима**\n\n"
+        f"Текущее время: **{datetime.now().strftime('%H:%M')}**\n"
+        f"Ночной режим: **{'🟢 Активен' if is_night_time() else '🔴 Неактивен'}**\n\n"
+        f"Начало: **{SETTINGS.get('work_start', '22:30')}**\n"
+        f"Конец: **{SETTINGS.get('work_end', '07:59')}**\n\n"
+        f"В этом интервале бот будет отвечать на сообщения."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+def show_cooldown_settings(message):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton(
+        f"✏️ КД: {SETTINGS.get('reply_cooldown', 3600)//60} мин",
+        callback_data="ar_cooldown_value"
+    ))
+    kb.add(InlineKeyboardButton(
+        "🔄 Сбросить КД для всех чатов",
+        callback_data="ar_cooldown_reset"
+    ))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="ar_menu"))
+    
+    text = (
+        f"⏰ **Настройка КД (перезарядки)**\n\n"
+        f"Текущее КД: **{SETTINGS.get('reply_cooldown', 3600)//60} минут**\n"
+        f"({SETTINGS.get('reply_cooldown', 3600)} секунд)\n\n"
+        f"КД — время, которое нужно подождать\n"
+        f"перед следующим ответом в том же чате."
+    )
+    
+    bot.send_message(message.chat.id, text, reply_markup=kb)
+
+# ============================================
+# 🚀 ИНИЦИАЛИЗАЦИЯ
+# ============================================
+
+def init_plugin(c):
+    global cardinal, tg, bot
+    cardinal = c
+    tg = c.telegram
+    bot = c.telegram.bot
+    
+    print("=" * 50)
+    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.6")
+    print("[AR] 🌙 Ночной режим: 22:30 - 07:59")
+    print("[AR] 🔄 Событийная модель (только на входящие сообщения)")
+    print("=" * 50)
+    
+    load_config()
+    
+    c.add_telegram_commands(UUID, [
+        ("ar", "💬 Автоответы", True)
+    ])
+    tg.msg_handler(show_menu, commands=["ar"])
+    
+    def handle_input(message):
+        state = tg.get_state(message.chat.id, message.from_user.id)
+        if not state:
+            return
+        
+        action = state.get("action")
+        
+        if action == "ar_edit_message":
+            SETTINGS["reply_message"] = message.text.strip()
+            save_config()
+            bot.reply_to(message, "✅ Текст ответа обновлён!")
+            show_menu(message)
+        
+        elif action == "ar_time_start":
+            time_str = message.text.strip()
+            if re.match(r'^\d{2}:\d{2}$', time_str):
+                SETTINGS["work_start"] = time_str
+                save_config()
+                bot.reply_to(message, f"✅ Начало ночного режима: {time_str}")
+            else:
+                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
+            show_time_settings(message)
+        
+        elif action == "ar_time_end":
+            time_str = message.text.strip()
+            if re.match(r'^\d{2}:\d{2}$', time_str):
+                SETTINGS["work_end"] = time_str
+                save_config()
+                bot.reply_to(message, f"✅ Конец ночного режима: {time_str}")
+            else:
+                bot.reply_to(message, "❌ Неверный формат! Используйте HH:MM")
+            show_time_settings(message)
+        
+        elif action == "ar_cooldown_value":
+            try:
+                value = int(message.text.strip())
+                if value >= 0:
+                    SETTINGS["reply_cooldown"] = value
+                    save_config()
+                    bot.reply_to(message, f"✅ КД установлено: {value} секунд ({value//60} мин)")
+                else:
+                    bot.reply_to(message, "❌ Введите положительное число!")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число!")
+            show_cooldown_settings(message)
+        
+        tg.clear_state(message.chat.id, message.from_user.id)
+    
+    tg.msg_handler(handle_input, func=lambda m: tg.check_state(m.chat.id, m.from_user.id))
+    
+    # 🔥 КОЛБЭКИ
+    def toggle_cb(call):
+        SETTINGS["active"] = not SETTINGS.get("active", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['active'] else 'OFF'}")
+        show_menu(call.message)
+    
+    def reply_toggle_cb(call):
+        SETTINGS["auto_reply_enabled"] = not SETTINGS.get("auto_reply_enabled", True)
+        save_config()
+        bot.answer_callback_query(call.id, f"{'ON' if SETTINGS['auto_reply_enabled'] else 'OFF'}")
+        show_menu(call.message)
+    
+    def refresh_cb(call):
+        bot.answer_callback_query(call.id, "🔄 Обновлено")
+        show_menu(call.message)
+    
+    def menu_cb(call):
+        bot.answer_callback_query(call.id)
+        show_menu(call.message)
+    
+    def edit_message_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "📝 Введите новый текст для автоответа:")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_edit_message")
+    
+    def time_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_time_settings(call.message)
+    
+    def time_start_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "🌙 Введите время начала ночного режима (HH:MM):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_time_start")
+    
+    def time_end_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "🌙 Введите время окончания ночного режима (HH:MM):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_time_end")
+    
+    def cooldown_settings_cb(call):
+        bot.answer_callback_query(call.id)
+        show_cooldown_settings(call.message)
+    
+    def cooldown_value_cb(call):
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "✏️ Введите КД в секундах (например: 3600 = 1 час):")
+        tg.set_state(call.message.chat.id, call.from_user.id, "ar_cooldown_value")
+    
+    def cooldown_reset_cb(call):
+        SETTINGS["last_reply_time"] = {}
+        save_config()
+        bot.answer_callback_query(call.id, "✅ КД сброшен для всех чатов!")
+        show_cooldown_settings(call.message)
+    
+    tg.cbq_handler(toggle_cb, lambda call: call.data == "ar_toggle")
+    tg.cbq_handler(reply_toggle_cb, lambda call: call.data == "ar_reply_toggle")
+    tg.cbq_handler(refresh_cb, lambda call: call.data == "ar_refresh")
+    tg.cbq_handler(menu_cb, lambda call: call.data == "ar_menu")
+    tg.cbq_handler(edit_message_cb, lambda call: call.data == "ar_edit_message")
+    tg.cbq_handler(time_settings_cb, lambda call: call.data == "ar_time_settings")
+    tg.cbq_handler(time_start_cb, lambda call: call.data == "ar_time_start")
+    tg.cbq_handler(time_end_cb, lambda call: call.data == "ar_time_end")
+    tg.cbq_handler(cooldown_settings_cb, lambda call: call.data == "ar_cooldown_settings")
+    tg.cbq_handler(cooldown_value_cb, lambda call: call.data == "ar_cooldown_value")
+    tg.cbq_handler(cooldown_reset_cb, lambda call: call.data == "ar_cooldown_reset")
+    
+    print("[AR] ✅ Плагин загружен!")
+    print("[AR] 📌 /ar — меню настроек")
+    print("=" * 50)
+
+# ============================================
+# 🔗 ТОЧКИ ВХОДА
+# ============================================
+
+BIND_TO_PRE_INIT = [init_plugin]
+BIND_TO_NEW_MESSAGE = [message_handler]
+BIND_TO_DELETE = None
