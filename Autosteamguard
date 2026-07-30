@@ -12,7 +12,7 @@ from datetime import datetime
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "AutoReply"
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 DESCRIPTION = "Автоответы с КД и периодом работы"
 CREDITS = "@qneiz"
 UUID = str(uuid_lib.uuid4())
@@ -50,8 +50,8 @@ DEFAULT_SETTINGS = {
     "active": True,
     "reply_message": "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.",
     "reply_cooldown": 86400,  # 1 день
-    "work_start": "22:30",    # Начало работы
-    "work_end": "07:59",      # Конец работы
+    "work_start": "22:30",
+    "work_end": "07:59",
     "admin_notify": True,
     "admin_chat_id": 0,
     "last_reply_time": {},
@@ -87,14 +87,12 @@ def save_config():
         logger.error(f"Ошибка сохранения: {e}")
 
 def is_work_time():
-    """Проверяет, сейчас рабочий период"""
     now = datetime.now()
     current_time = now.strftime("%H:%M")
     
     start = SETTINGS.get("work_start", "22:30")
     end = SETTINGS.get("work_end", "07:59")
     
-    # Если период переходит через полночь (22:30 - 07:59)
     if start > end:
         if current_time >= start and current_time <= "23:59":
             return True
@@ -102,7 +100,6 @@ def is_work_time():
             return True
         return False
     else:
-        # Обычный период (08:00 - 20:00)
         return start <= current_time <= end
 
 def format_text_with_variables(text, username=None):
@@ -123,7 +120,6 @@ def format_text_with_variables(text, username=None):
     return text
 
 def can_send_reply(chat_id):
-    """Проверяет КД"""
     last_reply_time = SETTINGS.get("last_reply_time", {})
     now = time.time()
     last_reply = last_reply_time.get(str(chat_id), 0)
@@ -135,33 +131,44 @@ def can_send_reply(chat_id):
     return True
 
 def update_last_reply(chat_id):
-    """Обновляет время последнего ответа"""
     last_reply_time = SETTINGS.get("last_reply_time", {})
     last_reply_time[str(chat_id)] = time.time()
     SETTINGS["last_reply_time"] = last_reply_time
     save_config()
 
 # ============================================
-# 🔄 ОБРАБОТЧИК СООБЩЕНИЙ
+# 🔄 ОБРАБОТЧИК СООБЩЕНИЙ (ИСПРАВЛЕН)
 # ============================================
 
-def message_handler(msg_obj):
-    """Обрабатывает новое сообщение через хук BIND_TO_NEW_MESSAGE"""
+def message_handler(msg_obj, *args):
+    """
+    Обрабатывает новое сообщение через хук BIND_TO_NEW_MESSAGE
+    Принимает 1 или 2 аргумента (совместимость с разными версиями Cardinal)
+    """
     
     if not SETTINGS.get("active", True):
         return
     
-    # Проверка периода работы
     if not is_work_time():
         return
     
     try:
+        # 🔥 Если передан 1 аргумент — это объект сообщения
+        # Если передан 2 аргумента — это (event, message) или (message, something)
+        # Определяем, что у нас в переменной msg_obj
+        
+        # Если msg_obj — это событие с атрибутом message
+        if hasattr(msg_obj, 'message'):
+            msg = msg_obj.message
+        else:
+            msg = msg_obj
+        
         # Проверяем, что сообщение не от нас
-        if getattr(msg_obj, "is_employee", False):
+        if getattr(msg, "is_employee", False):
             return
         
         # Получаем chat_id
-        chat_id = getattr(msg_obj, "chat_id", None) or getattr(msg_obj, "node_id", None)
+        chat_id = getattr(msg, "chat_id", None) or getattr(msg, "node_id", None)
         if not chat_id:
             return
         
@@ -171,10 +178,10 @@ def message_handler(msg_obj):
         
         # Получаем имя покупателя
         username = None
-        if hasattr(msg_obj, "author"):
-            username = msg_obj.author
-        elif hasattr(msg_obj, "user_name"):
-            username = msg_obj.user_name
+        if hasattr(msg, "author"):
+            username = msg.author
+        elif hasattr(msg, "user_name"):
+            username = msg.user_name
         
         # Отправляем ответ
         try:
@@ -182,7 +189,6 @@ def message_handler(msg_obj):
                 "Здравствуйте! Я сейчас сплю😴 Если вы не против я выполню ваш заказ завтра начав примерно в 8 утра по МСК, оставьте все нужные данные, информацию для выполнения работы, либо сразу запросите возврат.")
             reply_text = format_text_with_variables(reply_text, username)
             
-            # Отправка в чат FunPay
             if hasattr(cardinal.account, 'send_message'):
                 cardinal.account.send_message(chat_id, reply_text)
             else:
@@ -280,8 +286,7 @@ def show_time_settings(message):
         f"Период активен: **{'🟢 ДА' if is_work_time() else '🔴 НЕТ'}**\n\n"
         f"Начало: **{SETTINGS.get('work_start', '22:30')}**\n"
         f"Конец: **{SETTINGS.get('work_end', '07:59')}**\n\n"
-        f"В этом периоде бот будет отвечать на сообщения.\n"
-        f"Если начало > конца — период переходит через полночь."
+        f"В этом периоде бот будет отвечать на сообщения."
     )
     
     bot.send_message(message.chat.id, text, reply_markup=kb)
@@ -323,8 +328,8 @@ def init_plugin(c):
     bot = c.telegram.bot
     
     print("=" * 50)
-    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.8")
-    print("[AR] 🔄 Автоответы с периодом работы")
+    print("[AR] 💬 ЗАГРУЗКА AutoReply v2.9")
+    print("[AR] 🔄 Исправлена совместимость с версиями Cardinal")
     print("=" * 50)
     
     load_config()
